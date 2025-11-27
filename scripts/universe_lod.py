@@ -111,6 +111,66 @@ def _write_json_array(path: Path, rows: List[Dict[str, object]]) -> None:
     path.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
 
 
+def _force_spread(points: np.ndarray, iters: int = 200, step: float = 0.01, repulsion: float = 1.0, gravity: float = 0.01) -> np.ndarray:
+    """
+    Lightweight 3D force-directed spread (repulsion + mild gravity).
+    """
+    pos = points.astype(np.float32).copy()
+    n = pos.shape[0]
+    if n == 0 or iters <= 0:
+        return pos
+    for _ in range(iters):
+        diffs = pos[:, None, :] - pos[None, :, :]
+        dist2 = np.sum(diffs * diffs, axis=2) + 1e-6
+        np.fill_diagonal(dist2, 1e-6)
+        inv = repulsion / dist2  # (n,n)
+        np.fill_diagonal(inv, 0.0)
+        forces = (inv[..., None] * diffs).sum(axis=1)
+        forces -= gravity * pos
+        pos += step * forces
+    return pos
+
+
+def _pack_non_overlapping(
+    points: np.ndarray,
+    radii: np.ndarray,
+    iters: int = 200,
+    step: float = 0.02,
+    margin: float = 0.05,
+) -> np.ndarray:
+    """
+    Simple repulsive packing to reduce centroid overlap.
+
+    points: (n,3) repo centroids
+    radii:  (n,) effective radii per repo (e.g., based on entity counts)
+    """
+    pos = points.astype(np.float32).copy()
+    n = pos.shape[0]
+    if n == 0 or radii.shape[0] != n:
+        return pos
+
+    for _ in range(iters):
+        diffs = pos[:, None, :] - pos[None, :, :]
+        dist = np.linalg.norm(diffs + 1e-9, axis=2)
+        desired = radii[:, None] + radii[None, :] + margin
+        overlap = desired - dist
+        np.fill_diagonal(overlap, 0.0)
+
+        push_mask = overlap > 0
+        if not np.any(push_mask):
+            break
+
+        # Normalize directions; avoid division by zero.
+        dirs = np.zeros_like(diffs)
+        nonzero = dist > 1e-6
+        dirs[nonzero] = diffs[nonzero] / dist[nonzero, None]
+
+        forces = (dirs * (overlap * push_mask)[..., None]).sum(axis=1)
+        pos += step * forces
+
+    return pos
+
+
 def _build_edges_subset(
     edges_path: Path,
     keep_nodes: Set[str],
@@ -137,8 +197,9 @@ def _write_viewer(lod_dir: Path, levels: List[int]) -> None:
   <meta charset="utf-8" />
   <title>Repo Universe LOD Viewer</title>
   <style>
-    body, html, #app { margin:0; padding:0; width:100%; height:100%; background: #0b0b0b; color: #eee; }
-    #controls { position: absolute; top: 8px; left: 8px; z-index: 10; background: rgba(255,255,255,0.9); color:#000; padding: 6px 10px; border-radius: 6px; font-family: sans-serif; }
+    html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#0b0b0b; color:#eee; }
+    #app { position:fixed; inset:0; }
+    #controls { position: fixed; top: 8px; left: 8px; z-index: 10; background: rgba(255,255,255,0.9); color:#000; padding: 6px 10px; border-radius: 6px; font-family: sans-serif; }
   </style>
   <script src="https://unpkg.com/deck.gl@latest/dist.min.js"></script>
   <script src="https://unpkg.com/@loaders.gl/core@latest/dist/dist.min.js"></script>
@@ -154,13 +215,24 @@ def _write_viewer(lod_dir: Path, levels: List[int]) -> None:
   </div>
   <div id="app"></div>
   <script>
-    const {Deck, ScatterplotLayer, OrbitView, OrbitController, COORDINATE_SYSTEM} = deck;
+    const {Deck, ScatterplotLayer, LineLayer, OrbitView, OrbitController, COORDINATE_SYSTEM} = deck;
     const levelSelect = document.getElementById('level');
     const status = document.getElementById('status');
     // Base path for the LOD files; keep relative to the viewer location.
     const lodRoot = './';
     let deckgl;
     let currentViewState = null;
+    let currentLevel = null;
+    let currentRows = [];
+    let nodePos = new Map();
+    let edgesCache = null;
+    let selectedRepo = null;
+    const lodCache = {};
+    const lodLevels = [
+      {file: 'lod_10000.json', maxZoom: 1.0},
+      {file: 'lod_50000.json', maxZoom: 2.5},
+      {file: 'lod_200000.json', maxZoom: Infinity},
+    ];
 
     function hashColor(str) {
       let h = 0;
@@ -172,6 +244,7 @@ def _write_viewer(lod_dir: Path, levels: List[int]) -> None:
     }
 
     async function loadLevel(fname) {
+      if (lodCache[fname]) return lodCache[fname];
       status.textContent = 'loading ' + fname + ' …';
       const url = lodRoot + fname;
       const resp = await fetch(url);
@@ -185,8 +258,31 @@ def _write_viewer(lod_dir: Path, levels: List[int]) -> None:
         console.error('failed to parse JSON', e);
         throw e;
       }
+      lodCache[fname] = rows;
       status.textContent = rows.length + ' nodes';
       return rows;
+    }
+
+    async function loadEdges() {
+      if (edgesCache) return edgesCache;
+      try {
+        const resp = await fetch(lodRoot + 'edges_50000.jsonl');
+        if (!resp.ok) return [];
+        const text = await resp.text();
+        const lines = text.split('\\n').map(l => l.trim()).filter(Boolean);
+        edgesCache = lines.map(l => JSON.parse(l));
+        return edgesCache;
+      } catch (e) {
+        console.error('failed to load edges', e);
+        return [];
+      }
+    }
+
+    function levelForZoom(z) {
+      for (const lvl of lodLevels) {
+        if (z <= lvl.maxZoom) return lvl.file;
+      }
+      return lodLevels[lodLevels.length - 1].file;
     }
 
     function computeViewState(rows) {
@@ -210,7 +306,7 @@ def _write_viewer(lod_dir: Path, levels: List[int]) -> None:
       return view;
     }
 
-    function render(rows) {
+    function render(rows, edges) {
       const layer = new ScatterplotLayer({
         id: 'nodes',
         data: rows,
@@ -220,9 +316,20 @@ def _write_viewer(lod_dir: Path, levels: List[int]) -> None:
         radiusUnits: 'pixels',
         radiusMinPixels: 4,
         radiusMaxPixels: 16,
-        getFillColor: d => hashColor(d.repo || ''),
+        getFillColor: d => {
+          if (selectedRepo && d.repo === selectedRepo) return [255, 180, 80, 255];
+          if (selectedRepo) return [80, 80, 80, 80];
+          return hashColor(d.repo || '');
+        },
         opacity: 0.6,
         pickable: true,
+        onClick: info => {
+          if (info.object) {
+            selectedRepo = info.object.repo;
+            status.textContent = `selected repo ${selectedRepo}`;
+            render(currentRows, edgesCache || []);
+          }
+        },
         onHover: info => {
           const el = document.getElementById('status');
           if (info.object) {
@@ -232,17 +339,39 @@ def _write_viewer(lod_dir: Path, levels: List[int]) -> None:
           }
         },
       });
+
+      let layers = [layer];
+      if (selectedRepo && edges && edges.length) {
+        const filtered = edges.filter(e => e.repo_id === selectedRepo && nodePos.has(e.src) && nodePos.has(e.dst));
+        if (filtered.length) {
+          layers.unshift(new LineLayer({
+            id: 'edges',
+            data: filtered,
+            coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
+            getSourcePosition: d => nodePos.get(d.src),
+            getTargetPosition: d => nodePos.get(d.dst),
+            getColor: [180, 180, 180, 120],
+            widthUnits: 'pixels',
+            widthMinPixels: 1,
+            widthMaxPixels: 4,
+            opacity: 0.5,
+            visible: true,
+          }));
+        }
+      }
+
       if (!deckgl) {
         deckgl = new Deck({
           container: 'app',
           views: new OrbitView({id: 'orbit'}),
           controller: {type: OrbitController, dragRotate: true, inertia: true},
           initialViewState: currentViewState || {id:'orbit', target: [0,0,0], zoom: 4, rotationX: 45, rotationOrbit: 30},
-          layers: [layer],
+          layers,
           parameters: {clearColor: [0.05, 0.05, 0.05, 1]},
           onViewStateChange: ({viewState}) => {
             currentViewState = viewState;
             deckgl.setProps({viewState});
+            maybeSwitchLOD(viewState.zoom);
           },
           onError: err => {
             console.error('deck error', err);
@@ -250,22 +379,43 @@ def _write_viewer(lod_dir: Path, levels: List[int]) -> None:
           },
         });
       } else {
-        deckgl.setProps({layers: [layer], viewState: currentViewState || undefined});
+        deckgl.setProps({layers, viewState: currentViewState || undefined});
+      }
+    }
+
+    async function switchLevel(file, preserveView) {
+      if (currentLevel === file) return;
+      currentLevel = file;
+      levelSelect.value = file;
+      selectedRepo = null;
+      const rows = await loadLevel(file);
+      if (!rows || !rows.length) {
+        status.textContent = 'no data in ' + file;
+        if (deckgl) deckgl.setProps({layers: []});
+        return;
+      }
+      currentRows = rows;
+      nodePos = new Map(rows.map(r => [r.node_id, [r.x, r.y, r.z]]));
+      if (!preserveView) currentViewState = computeViewState(rows);
+      console.log('loaded', rows.length, 'nodes; viewState', currentViewState);
+      render(rows, edgesCache || []);
+    }
+
+    async function maybeSwitchLOD(zoom) {
+      const targetLevel = levelForZoom(zoom || 0);
+      if (targetLevel !== currentLevel) {
+        await switchLevel(targetLevel, /*preserveView=*/true);
+      } else {
+        render(currentRows, edgesCache || []);
       }
     }
 
     async function refresh() {
-      const fname = levelSelect.value;
       try {
-        const rows = await loadLevel(fname);
-        if (!rows || !rows.length) {
-          status.textContent = 'no data in ' + fname;
-          if (deckgl) deckgl.setProps({layers: []});
-          return;
-        }
-        currentViewState = computeViewState(rows);
-        console.log('loaded', rows.length, 'nodes; viewState', currentViewState);
-        render(rows);
+        const lvl = levelForZoom(currentViewState ? currentViewState.zoom || 0 : 0);
+        await switchLevel(lvl, /*preserveView=*/false);
+        // Preload edges in the background.
+        loadEdges();
       } catch (err) {
         console.error('refresh failed', err);
         status.textContent = 'error: ' + err;
@@ -289,6 +439,8 @@ def build_lod(
     edges_level: int | None,
     max_edges: int,
     separate_repos_scale: float = 0.0,
+    force_layout_iters: int = 0,
+    pack_repos: bool = False,
 ) -> None:
     uni_root = export_root / UNIVERSE_DIRNAME
     nodes_path = uni_root / "nodes.jsonl"
@@ -309,6 +461,17 @@ def build_lod(
             repo_coords = np.load(repo_coords_path)
             man = json.loads(manifest_path.read_text())
             repo_ids = man.get("repo_ids") or []
+            if force_layout_iters > 0:
+                repo_coords = _force_spread(repo_coords, iters=force_layout_iters, step=0.01, repulsion=1.0, gravity=0.005)
+            if pack_repos:
+                repo_meta = man.get("repos") or {}
+                radii = []
+                for idx, rid in enumerate(repo_ids):
+                    meta = repo_meta.get(rid, {}) if isinstance(repo_meta, dict) else {}
+                    ent = meta.get("entities") or meta.get("entity_count") or 1
+                    r = 0.5 + math.log1p(ent) * 0.05
+                    radii.append(r)
+                repo_coords = _pack_non_overlapping(repo_coords, np.array(radii, dtype=np.float32), iters=200, step=0.02)
             for idx, rid in enumerate(repo_ids):
                 if idx < repo_coords.shape[0]:
                     repo_offset[str(rid)] = np.asarray(repo_coords[idx]) * separate_repos_scale
@@ -372,6 +535,8 @@ def main() -> None:
     parser.add_argument("--edges-level", type=int, default=50000, help="Which LOD to emit sampled edges for (0 to skip).")
     parser.add_argument("--max-edges", type=int, default=200000, help="Max edges to keep for the edges-level.")
     parser.add_argument("--separate-repos-scale", type=float, default=0.0, help="If >0, offset nodes by repo centroid scaled by this factor to spread repos apart.")
+    parser.add_argument("--force-layout-iters", type=int, default=0, help="If >0, run a lightweight force-directed spread on repo centroids before scaling (helps avoid clumping).")
+    parser.add_argument("--pack-repos", action="store_true", help="If set, run a simple non-overlap packing on repo centroids using per-repo radii.")
     args = parser.parse_args()
 
     levels = [int(x) for x in args.levels.split(",") if x.strip()]
@@ -382,6 +547,8 @@ def main() -> None:
         edges_level=edges_level,
         max_edges=int(args.max_edges),
         separate_repos_scale=float(args.separate_repos_scale),
+        force_layout_iters=int(args.force_layout_iters),
+        pack_repos=bool(args.pack_repos),
     )
 
 

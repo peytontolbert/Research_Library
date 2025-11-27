@@ -101,15 +101,28 @@ def _download_arxiv_pdf(arxiv_id: str, *, timeout: int = 60) -> bool:
     Download a single Arxiv PDF by id into ARXIV_PDF_ROOT.
 
     Returns True if a new file was created, False if it already existed.
+
+    PDFs are stored primarily under `/arxiv/pdfs/YYMM/<id>.pdf`, where `YYMM`
+    comes from the first 4 digits of the Arxiv ID (e.g. `2101.00001` ->
+    `/arxiv/pdfs/2101/2101.00001.pdf`). If an ID does not start with 4 digits,
+    it falls back to `/arxiv/pdfs/<id>.pdf`.
     """
-    ARXIV_PDF_ROOT.mkdir(parents=True, exist_ok=True)
 
     # Match the downloader script behavior: use the trailing segment.
     norm_id = str(arxiv_id or "").strip().split("/")[-1]
     if not norm_id:
         raise ValueError("invalid arxiv_id")
+
+    # Decide on output directory: prefer /arxiv/pdfs/YYMM/<id>.pdf when possible.
+    yymm = norm_id[:4]
+    if len(yymm) == 4 and yymm.isdigit():
+        out_dir = ARXIV_PDF_ROOT / yymm
+    else:
+        out_dir = ARXIV_PDF_ROOT
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     pdf_url = f"https://export.arxiv.org/pdf/{norm_id}.pdf"
-    out_path = ARXIV_PDF_ROOT / f"{norm_id}.pdf"
+    out_path = out_dir / f"{norm_id}.pdf"
 
     if out_path.exists():
         return False
@@ -2510,7 +2523,18 @@ async def api_arxiv_search(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any
     for rec in results:
         rec_id = str(rec.get("id") or "").strip()
         pdf_id = rec_id.split("/")[-1] if rec_id else ""
-        has_pdf = bool(pdf_id and (ARXIV_PDF_ROOT / f"{pdf_id}.pdf").is_file())
+        has_pdf = False
+        if pdf_id:
+            # Mirror the storage convention used by the downloader:
+            # - Prefer /arxiv/pdfs/YYMM/<id>.pdf when the id starts with YYMM.
+            # - Fall back to /arxiv/pdfs/<id>.pdf for non-standard ids.
+            yymm = pdf_id[:4]
+            if len(yymm) == 4 and yymm.isdigit():
+                pdf_path = ARXIV_PDF_ROOT / yymm / f"{pdf_id}.pdf"
+            else:
+                pdf_path = ARXIV_PDF_ROOT / f"{pdf_id}.pdf"
+            has_pdf = pdf_path.is_file()
+
         enriched = dict(rec)
         enriched["has_pdf"] = has_pdf
         results_with_pdf.append(enriched)
