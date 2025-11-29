@@ -14,9 +14,11 @@ exports/
 *.ptzpklz
 *.ptzpklzl
 seeds/
-models/
 exports/
 arxiv-public-datasets/
 __pycache__/
 *.log
 python_algorithms/
+checkpoints/
+*.bin
+*.safetensors
