@@ -111,6 +111,12 @@ def _write_json_array(path: Path, rows: List[Dict[str, object]]) -> None:
     path.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
 
 
+def _write_jsonl(path: Path, rows: List[Dict[str, object]]) -> None:
+    with path.open("w", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
 def _force_spread(points: np.ndarray, iters: int = 200, step: float = 0.01, repulsion: float = 1.0, gravity: float = 0.01) -> np.ndarray:
     """
     Lightweight 3D force-directed spread (repulsion + mild gravity).
@@ -199,7 +205,9 @@ def _write_viewer(lod_dir: Path, levels: List[int]) -> None:
   <style>
     html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#0b0b0b; color:#eee; }
     #app { position:fixed; inset:0; }
-    #controls { position: fixed; top: 8px; left: 8px; z-index: 10; background: rgba(255,255,255,0.9); color:#000; padding: 6px 10px; border-radius: 6px; font-family: sans-serif; }
+    #controls { position: fixed; top: 8px; left: 8px; z-index: 10; background: rgba(255,255,255,0.9); color:#000; padding: 6px 10px; border-radius: 6px; font-family: sans-serif; display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+    #repo-snap { display:flex; gap:4px; align-items:center; }
+    #repoSelect { min-width: 220px; }
   </style>
   <script src="https://unpkg.com/deck.gl@latest/dist.min.js"></script>
   <script src="https://unpkg.com/@loaders.gl/core@latest/dist/dist.min.js"></script>
@@ -211,6 +219,12 @@ def _write_viewer(lod_dir: Path, levels: List[int]) -> None:
     <select id="level">
       __LOD_OPTIONS__
     </select>
+    <span id="repo-snap">
+      <label for="repoSelect">Repo:</label>
+      <input list="repoList" id="repoSelect" placeholder="type to search…" />
+      <datalist id="repoList"></datalist>
+      <button id="snapBtn">Snap</button>
+    </span>
     <span id="status">loading…</span>
   </div>
   <div id="app"></div>
@@ -227,12 +241,17 @@ def _write_viewer(lod_dir: Path, levels: List[int]) -> None:
     let nodePos = new Map();
     let edgesCache = null;
     let selectedRepo = null;
+    let repoCentroids = [];
     const lodCache = {};
     const lodLevels = [
       {file: 'lod_10000.json', maxZoom: 1.0},
       {file: 'lod_50000.json', maxZoom: 2.5},
       {file: 'lod_200000.json', maxZoom: Infinity},
     ];
+    const repoSelect = document.getElementById('repoSelect');
+    const repoList = document.getElementById('repoList');
+    const snapBtn = document.getElementById('snapBtn');
+    let repoIds = [];
 
     function hashColor(str) {
       let h = 0;
@@ -306,7 +325,57 @@ def _write_viewer(lod_dir: Path, levels: List[int]) -> None:
       return view;
     }
 
+    function computeViewStateForRepo(repo) {
+      if (!repo) return null;
+      const subset = currentRows.filter(r => r.repo === repo);
+      if (!subset.length) return null;
+      let minX = Infinity, minY = Infinity, minZ = Infinity;
+      let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+      for (const r of subset) {
+        minX = Math.min(minX, r.x); maxX = Math.max(maxX, r.x);
+        minY = Math.min(minY, r.y); maxY = Math.max(maxY, r.y);
+        minZ = Math.min(minZ, r.z); maxZ = Math.max(maxZ, r.z);
+      }
+      const cx = (minX + maxX) / 2;
+      const cy = (minY + maxY) / 2;
+      const cz = (minZ + maxZ) / 2;
+      const extent = Math.max(maxX - minX, maxY - minY, maxZ - minZ);
+      const span = Math.max(extent, 1e-3);
+      const zoom = Math.min(12, Math.max(-2, Math.log2(64 / span)));
+      return {id:'orbit', target:[cx, cy, cz], zoom, rotationX:45, rotationOrbit:30, minZoom:-5, maxZoom:20};
+    }
+
     function render(rows, edges) {
+      const showHalos = currentViewState ? (currentViewState.zoom || 0) <= 3 : true;
+      const haloLayer = new ScatterplotLayer({
+        id: 'halos',
+        data: showHalos ? repoCentroids : [],
+        getPosition: d => [d.x, d.y, d.z],
+        coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
+        getRadius: d => d.radius || 1.0,
+        radiusUnits: 'meters',
+        radiusMinPixels: 8,
+        radiusMaxPixels: 120,
+        getFillColor: d => {
+          const base = hashColor(d.repo || '');
+          return [base[0], base[1], base[2], selectedRepo && d.repo === selectedRepo ? 160 : 80];
+        },
+        stroked: true,
+        getLineColor: [255,255,255,60],
+        lineWidthUnits: 'pixels',
+        lineWidthMinPixels: 1,
+        opacity: 0.25,
+        pickable: true,
+        onClick: info => {
+          if (info.object) {
+            snapToRepo(info.object.repo);
+          }
+        },
+        onHover: info => {
+          if (info.object) status.textContent = `repo ${info.object.repo}`;
+        },
+      });
+
       const layer = new ScatterplotLayer({
         id: 'nodes',
         data: rows,
@@ -340,7 +409,7 @@ def _write_viewer(lod_dir: Path, levels: List[int]) -> None:
         },
       });
 
-      let layers = [layer];
+      let layers = [haloLayer, layer];
       if (selectedRepo && edges && edges.length) {
         const filtered = edges.filter(e => e.repo_id === selectedRepo && nodePos.has(e.src) && nodePos.has(e.dst));
         if (filtered.length) {
@@ -423,8 +492,46 @@ def _write_viewer(lod_dir: Path, levels: List[int]) -> None:
       }
     }
 
+    async function loadRepoIds() {
+      try {
+        const resp = await fetch('../manifest.json');
+        if (!resp.ok) return;
+        const man = await resp.json();
+        const ids = man.repo_ids || [];
+        repoIds = ids;
+        repoList.innerHTML = ids.map(id => `<option value="${id}"></option>`).join('');
+      } catch (e) {
+        console.warn('failed to load repo ids', e);
+      }
+    }
+
+    async function loadRepoCentroids() {
+      try {
+        const resp = await fetch('./repo_centroids.json');
+        if (!resp.ok) return;
+        repoCentroids = await resp.json();
+      } catch (e) {
+        console.warn('failed to load repo centroids', e);
+        repoCentroids = [];
+      }
+    }
+
+    async function snapToRepo(repo) {
+      if (!repo) return;
+      selectedRepo = repo;
+      // Ensure we are on the highest LOD for best detail.
+      await switchLevel('lod_200000.json', /*preserveView=*/false);
+      const vs = computeViewStateForRepo(repo);
+      if (vs) {
+        currentViewState = vs;
+      }
+      status.textContent = `selected repo ${repo}`;
+      render(currentRows, edgesCache || []);
+    }
+
     levelSelect.addEventListener('change', refresh);
-    refresh();
+    snapBtn.addEventListener('click', () => snapToRepo(repoSelect.value.trim()));
+    Promise.all([loadRepoIds(), loadRepoCentroids()]).then(() => refresh());
   </script>
 </body>
 </html>
@@ -456,27 +563,41 @@ def build_lod(
     assert coords.shape[0] == len(nodes), "coords and nodes count mismatch"
 
     repo_offset: Dict[str, np.ndarray] = {}
+    repo_centroids: List[Dict[str, float]] = []
     if separate_repos_scale > 0.0 and repo_coords_path.exists() and manifest_path.exists():
         try:
             repo_coords = np.load(repo_coords_path)
             man = json.loads(manifest_path.read_text())
             repo_ids = man.get("repo_ids") or []
+            repo_meta = man.get("repos") or {}
+            radii: List[float] = []
+            for rid in repo_ids:
+                meta = repo_meta.get(rid, {}) if isinstance(repo_meta, dict) else {}
+                ent = meta.get("entities") or meta.get("entity_count") or 1
+                r = 0.5 + math.log1p(ent) * 0.05
+                radii.append(r)
             if force_layout_iters > 0:
                 repo_coords = _force_spread(repo_coords, iters=force_layout_iters, step=0.01, repulsion=1.0, gravity=0.005)
             if pack_repos:
-                repo_meta = man.get("repos") or {}
-                radii = []
-                for idx, rid in enumerate(repo_ids):
-                    meta = repo_meta.get(rid, {}) if isinstance(repo_meta, dict) else {}
-                    ent = meta.get("entities") or meta.get("entity_count") or 1
-                    r = 0.5 + math.log1p(ent) * 0.05
-                    radii.append(r)
                 repo_coords = _pack_non_overlapping(repo_coords, np.array(radii, dtype=np.float32), iters=200, step=0.02)
             for idx, rid in enumerate(repo_ids):
                 if idx < repo_coords.shape[0]:
-                    repo_offset[str(rid)] = np.asarray(repo_coords[idx]) * separate_repos_scale
+                    offset_coord = np.asarray(repo_coords[idx]) * separate_repos_scale
+                    repo_offset[str(rid)] = offset_coord
+                    rad = radii[idx] if idx < len(radii) else 1.0
+                    halo_r = rad * separate_repos_scale
+                    repo_centroids.append(
+                        {
+                            "repo": str(rid),
+                            "x": float(offset_coord[0]),
+                            "y": float(offset_coord[1]),
+                            "z": float(offset_coord[2]),
+                            "radius": float(max(halo_r, 0.5)),
+                        }
+                    )
         except Exception:
             repo_offset = {}
+            repo_centroids = []
 
     manifest = {"levels": []}
     for level in levels:
@@ -525,6 +646,8 @@ def build_lod(
         "repo_coords": str(repo_coords_path),
     }
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    if repo_centroids:
+        _write_json_array(lod_dir / "repo_centroids.json", repo_centroids)
     _write_viewer(lod_dir, levels)
 
 
