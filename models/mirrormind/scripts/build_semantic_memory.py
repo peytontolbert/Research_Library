@@ -21,13 +21,53 @@ from models.mirrormind.memory import (
     EpisodicMemoryStore,
     SemanticMemoryStore,
     build_semantic_summaries,
+    build_temporal_semantic_summaries,
     Episode,
     SemanticSummary,
 )
+from models.mirrormind.llm import safe_build_llm
 
 
 def _load_episodes(path: Path) -> EpisodicMemoryStore:
     return EpisodicMemoryStore.load(path)
+
+
+def _llm_summarizer() -> Callable[[str], str]:
+    """
+    Build an LLM-based summarizer for episodic → semantic aggregation.
+
+    This is intentionally *not* optional for the CLI: if the model cannot be
+    loaded, we raise instead of silently falling back to raw concatenation of
+    code, so that semantic memory truly reflects LLM-derived summaries as
+    described in models/paper.md.
+    """
+    model, tokenizer, _ = safe_build_llm()
+    if model is None or tokenizer is None:
+        raise RuntimeError(
+            "LLM summarizer unavailable; ensure Llama checkpoints are present "
+            "under /data/checkpoints before running build_semantic_memory.py."
+        )
+
+    def _summarize(text: str) -> str:
+        prompt = (
+            "Summarize the following repository- or paper-related episodes "
+            "(code chunks, documentation, commit messages, issues, etc.) into "
+            "5–8 bullet points capturing:\n"
+            "- key modules, functions, and classes\n"
+            "- important behaviors, APIs, and invariants\n"
+            "- any notable patterns, bugs, or refactors mentioned.\n\n"
+            "Keep the summary concise but include specific names where possible.\n\n"
+            f"{text}"
+        )
+        # Guard input length to avoid OOM; truncate long spans.
+        max_chars = 6000
+        if len(prompt) > max_chars:
+            prompt = prompt[:max_chars]
+        inputs = tokenizer(prompt, return_tensors="pt")
+        outputs = model.generate(**inputs, max_new_tokens=256)
+        return tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+    return _summarize
 
 
 def build_for_entities(
@@ -37,9 +77,31 @@ def build_for_entities(
     summarize_fn: Optional[Callable[[str], str]] = None,
 ) -> SemanticMemoryStore:
     out = SemanticMemoryStore()
+    # If no explicit summarizer is provided (e.g., from a caller using this as
+    # a library function), default to the shared LLM summarizer so that
+    # summaries are never just raw concatenations of episode text.
+    if summarize_fn is None:
+        summarize_fn = _llm_summarizer()
     for ent in entities:
         episodes = episodic.episodes_for(ent)
-        summaries = build_semantic_summaries(ent, episodes, summarize_fn=summarize_fn, scope_label=scope_label)
+        if not episodes:
+            continue
+        # For commit-style trajectories, prefer temporal sharding to produce
+        # multiple windows per repo/entity as described in the spec.
+        if scope_label.lower() == "commits" or all(ep.type == "commit_message" for ep in episodes):
+            summaries = build_temporal_semantic_summaries(
+                ent,
+                episodes,
+                summarize_fn=summarize_fn,
+                scope_label=scope_label,
+            )
+        else:
+            summaries = build_semantic_summaries(
+                ent,
+                episodes,
+                summarize_fn=summarize_fn,
+                scope_label=scope_label,
+            )
         out.bulk_add(summaries)
     return out
 
@@ -54,7 +116,15 @@ def main() -> None:
 
     episodic = _load_episodes(args.episodes)
     entities = [args.entity_id] if args.entity_id else episodic.entities()
-    semantic_store = build_for_entities(episodic, entities, scope_label=args.scope_label)
+    semantic_store = build_for_entities(
+        episodic,
+        entities,
+        scope_label=args.scope_label,
+        # For the CLI entrypoint we always use the default LLM summarizer so
+        # that semantic memory is fully LLM-derived. Callers that want a
+        # different summarizer can pass one explicitly to build_for_entities().
+        summarize_fn=None,
+    )
     semantic_store.save(args.output)
     print(f"Built {sum(len(v) for v in semantic_store._by_entity.values())} summaries for {len(entities)} entities -> {args.output}")
 

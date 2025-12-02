@@ -26,6 +26,11 @@ class TaskDescriptor:
 class ReviewAgent:
     """Simple review synthesizer that merges partial plans."""
 
+    def __init__(self, domain_agent: Optional[DomainAgent] = None) -> None:
+        # Optional DomainAgent to annotate actions with concepts/domains and
+        # inch closer to the review variables in models/paper.md Section 5.2.
+        self.domain_agent = domain_agent
+
     def _extract_dependencies(self, plan: Dict[str, Any]) -> List[str]:
         """Best-effort extraction of dependencies from a plan."""
         deps = plan.get("dependencies") or []
@@ -81,10 +86,25 @@ class ReviewAgent:
         dependencies: Dict[str, List[str]] = {}
         uncertainty_flags: List[str] = []
 
+        # Track which evidence entries came from which plan/action index to
+        # provide a more structured evidence_map and basic risk scoring.
+        evidence_links: List[Dict[str, Any]] = []
+
         for idx, plan in enumerate(all_plans):
             plan_actions = [str(a) for a in plan.get("actions", [])]
+            plan_evidence = list(plan.get("evidence", []))
             actions.extend(plan_actions)
-            evidence.extend(plan.get("evidence", []))
+            evidence.extend(plan_evidence)
+            for a_idx, _ in enumerate(plan_actions):
+                for e_idx, ev in enumerate(plan_evidence):
+                    evidence_links.append(
+                        {
+                            "plan_index": idx,
+                            "action_index": a_idx,
+                            "evidence_index": len(evidence) - len(plan_evidence) + e_idx,
+                            "evidence": ev,
+                        }
+                    )
             deps = self._extract_dependencies(plan)
             if deps:
                 dependencies[f"plan_{idx}"] = deps
@@ -97,20 +117,63 @@ class ReviewAgent:
         issues: List[str] = []
         scored_actions: List[Dict[str, Any]] = []
         seen_actions = set()
+
+        # Aggregate evidence indices per action string to support a simple
+        # risk model and episode-level-style attribution (when plans carry
+        # richer evidence objects).
+        action_to_evidence_indices: Dict[str, List[int]] = {}
+        for link in evidence_links:
+            # Use a coarse key: plan-local action index and plan index.
+            # Callers that know more about their plan schema can enrich this.
+            key = f"plan_{link['plan_index']}_action_{link['action_index']}"
+            idx = int(link["evidence_index"])
+            action_to_evidence_indices.setdefault(key, []).append(idx)
+
         for act in actions:
             if act in seen_actions:
                 continue
             seen_actions.add(act)
             score = 1.0
+            risk_score = 0.0
             act_lower = act.lower()
             if "missing" in act_lower or "error" in act_lower:
                 issues.append(f"action_issue:{act}")
                 score = 0.2
+                risk_score = max(risk_score, 0.8)
             if "todo" in act_lower or "tbd" in act_lower:
                 issues.append(f"action_incomplete:{act}")
                 score = 0.3
-            scored_actions.append({"action": act, "score": score})
+                risk_score = max(risk_score, 0.6)
+            if "rollback" in act_lower:
+                risk_score = max(risk_score, 0.5)
+            scored_actions.append({"action": act, "score": score, "risk_score": risk_score})
+
+        # Optionally annotate actions with concept/domain tags using the
+        # DomainAgent to provide a more structural view of the global plan.
+        if self.domain_agent is not None:
+            for a in scored_actions:
+                concepts = self.domain_agent.search_concepts(a["action"], top_k=4)
+                concept_ids = [str(c.get("concept_id") or "") for c in concepts if c.get("concept_id")]
+                concept_names = [str(c.get("name") or "") for c in concepts if c.get("name")]
+                # Heuristically derive domain labels from special domain pseudo-node IDs.
+                domains: List[str] = []
+                for c in concepts:
+                    cid = str(c.get("concept_id") or "")
+                    if cid.startswith("__domain:") and c.get("name"):
+                        domains.append(str(c["name"]))
+                a["concept_ids"] = concept_ids
+                a["concept_names"] = concept_names
+                a["domains"] = sorted(set(domains))
+
         scored_actions = sorted(scored_actions, key=lambda x: x["score"], reverse=True)
+
+        # Also surface issues that are visible directly in the evidence
+        # payloads (e.g., "missing tests") so tests and downstream agents
+        # can detect gaps even when actions are terse.
+        for ev in evidence:
+            ev_text = str(ev).lower()
+            if "missing" in ev_text and f"evidence_issue:{ev}" not in issues:
+                issues.append(f"evidence_issue:{ev}")
 
         conflicts = self._detect_conflicts([a["action"] for a in scored_actions])
         issues.extend(conflicts)
@@ -134,6 +197,23 @@ class ReviewAgent:
             seen_flags.add(f)
             uniq_flags.append(f)
 
+        # In addition to the flat evidence_map, expose a coarse
+        # action_evidence_map keyed by the global_plan index so downstream
+        # callers can see which evidence items support which action.
+        action_evidence_map: Dict[str, List[int]] = {}
+        for idx, a in enumerate(scored_actions):
+            key = f"action_{idx}"
+            # We do not yet have stable action IDs across plans; attach any
+            # indices that were recorded under this action string key.
+            # This remains a lightweight proxy for the paper's per-episode
+            # attribution.
+            indices: List[int] = []
+            for k, vals in action_to_evidence_indices.items():
+                if a["action"] in k:
+                    indices.extend(vals)
+            if indices:
+                action_evidence_map[key] = sorted(set(indices))
+
         return {
             "global_plan": [a["action"] for a in scored_actions],
             "evidence_map": evidence_map,
@@ -142,6 +222,8 @@ class ReviewAgent:
             "consistency_report": consistency_report,
             "issues": issues,
             "uncertainty_flags": uniq_flags,
+            "action_evidence_map": action_evidence_map,
+            "action_scores": scored_actions,
         }
 
 
@@ -160,8 +242,11 @@ class Coordinator:
             graph = DomainGraph()
             client = FileGraphClient(graph)
             self.domain_agent = DomainAgent(domain_graph=graph, graph_client=client)
-        self.context_assembler = context_assembler or ContextAssembler()
-        self.review_agent = review_agent or ReviewAgent()
+        # Pass the DomainAgent into the context assembler so it can perform
+        # graph-aware semantic ranking when available, and into the review
+        # agent so it can annotate actions with concept/domain structure.
+        self.context_assembler = context_assembler or ContextAssembler(domain_agent=self.domain_agent)
+        self.review_agent = review_agent or ReviewAgent(domain_agent=self.domain_agent)
         self.last_concepts: List[Dict[str, object]] = []
         self.last_domains: List[str] = []
 

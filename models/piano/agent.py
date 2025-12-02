@@ -23,7 +23,7 @@ from models.mirrormind.llm import safe_build_llm
 from models.piano.policy import LLMIntentPolicy
 from models.mirrormind.graph_client import FileGraphClient
 from models.mirrormind.graph_neo4j import Neo4jGraphClient  # optional
-from models.mirrormind.domain import DomainGraph
+from models.mirrormind.domain import DomainGraph, DomainAgent
 import logging
 
 
@@ -45,13 +45,15 @@ class PianoAgent:
             self.logger.warning("PianoAgent running without LLM; TalkingModule will use template responses.")
         policy = LLMIntentPolicy(llm, allowed=list(Intent.__args__)) if llm else None  # type: ignore[attr-defined]
         self.controller = CognitiveController(policy=policy)
-        # Wire a file-backed graph client by default.
+        # Wire a concept/domain view over the unified graph as the agent's
+        # long-term memory substrate. Default to a file-backed DomainGraph but
+        # prefer Neo4j when available.
         graph = DomainGraph()
         graph_client = FileGraphClient(graph)
-        # If Neo4j is available, prefer it.
         try:
             graph_client = Neo4jGraphClient()  # type: ignore
         except Exception:
+            # Neo4j is optional; fall back to the in-process graph.
             pass
         self.state.domain_agent = DomainAgent(domain_graph=graph, graph_client=graph_client)
         self.goals = GoalGenerator(self.state.domain_agent)

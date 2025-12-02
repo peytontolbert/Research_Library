@@ -4,6 +4,7 @@ This remains lightweight and dependency-optional; actual HF imports are lazy.
 """
 
 import os
+from pathlib import Path
 from typing import Any, Dict, Optional
 from models.shared.data import build_dataset
 from models.shared.config import validate_cache_dirs
@@ -32,6 +33,11 @@ try:
     from datasets import Dataset as HFDataset
 except Exception:  # pragma: no cover - optional dependency
     HFDataset = None
+try:
+    from datasets import load_dataset, concatenate_datasets
+except Exception:  # pragma: no cover - optional dependency
+    load_dataset = None
+    concatenate_datasets = None
 try:
     from torch.utils.data import DataLoader
 except Exception:  # pragma: no cover - optional dependency
@@ -273,7 +279,186 @@ class Trainer:
             ]
         )
 
+    def _build_corpus_hf_dataset(self):
+        """
+        Build an HF Dataset (or DatasetDict) directly from the sharded corpus
+        under exports/corpus when dataset.sources includes corpus_* entries.
+
+        This bypasses the in-memory Python list construction in build_dataset
+        so we can train over the full corpus (repos, papers, and/or pairs)
+        backed by Arrow/JSONL on disk.
+        """
+        if load_dataset is None or HFDataset is None:
+            return None
+
+        ds_cfg = self.config.get("dataset", {}) or {}
+        sources = ds_cfg.get("sources") or []
+        wants_corpus = any(s in {"corpus_repos", "corpus_papers", "corpus_pairs"} for s in sources)
+        if not wants_corpus:
+            return None
+
+        corpus_root = Path(ds_cfg.get("corpus_dir") or "exports/corpus")
+        data_files: Dict[str, Any] = {}
+
+        def _glob(subdir: str, pattern: str) -> Any:
+            path = corpus_root / subdir
+            if not path.exists():
+                return []
+            return sorted(str(p) for p in path.glob(pattern))
+
+        if "corpus_repos" in sources:
+            repo_files = _glob("repos", "repo_*.jsonl")
+            if repo_files:
+                data_files["repos"] = repo_files
+        if "corpus_papers" in sources:
+            paper_files = _glob("papers", "paper_*.jsonl")
+            if paper_files:
+                data_files["papers"] = paper_files
+        if "corpus_pairs" in sources:
+            pair_files = _glob("pairs", "pair_*.jsonl")
+            if pair_files:
+                data_files["pairs"] = pair_files
+
+        if not data_files:
+            return None
+
+        raw = load_dataset("json", data_files=data_files)
+        archetype = get_archetype(self.config.get("model_id", "")) or {}
+        archetype_name = archetype.get("archetype", "generative")
+        ds_quality = ds_cfg.get("quality_filters") or {}
+        ds_domains = set(ds_cfg.get("domains") or [])
+        training_cfg = self.config.get("training", {}) or {}
+        eval_split = float(training_cfg.get("eval_split", 0.0) or 0.0)
+
+        # --- Quality filtering heuristics --------------------------------- #
+
+        def _len_bounds(kind: str) -> tuple[int, int]:
+            if kind == "repos":
+                return int(ds_quality.get("repos_min_chars", 64)), int(ds_quality.get("repos_max_chars", 65536))
+            if kind == "papers":
+                return int(ds_quality.get("papers_min_chars", 64)), int(ds_quality.get("papers_max_chars", 65536))
+            if kind == "pairs":
+                return int(ds_quality.get("pairs_min_chars", 64)), int(ds_quality.get("pairs_max_chars", 65536))
+            return 0, 10**9
+
+        def _filter_repos(ex: Dict[str, Any]) -> bool:
+            text = str(ex.get("text") or "").strip()
+            mn, mx = _len_bounds("repos")
+            if not (mn <= len(text) <= mx):
+                return False
+            meta = ex.get("meta") or {}
+            path = str(meta.get("path") or "")
+            # Basic path-based noise filtering (virtualenvs, caches, etc.).
+            noisy_fragments = ds_quality.get(
+                "repos_exclude_path_fragments",
+                ["site-packages", ".venv", "__pycache__", "node_modules", "dist-packages"],
+            )
+            for frag in noisy_fragments:
+                if frag and frag in path:
+                    return False
+            return True
+
+        def _filter_papers(ex: Dict[str, Any]) -> bool:
+            text = str(ex.get("text") or "").strip()
+            mn, mx = _len_bounds("papers")
+            if not (mn <= len(text) <= mx):
+                return False
+            return True
+
+        def _filter_pairs(ex: Dict[str, Any]) -> bool:
+            paper = str(ex.get("paper_text") or "").strip()
+            repo = str(ex.get("repo_text") or "").strip()
+            mn, mx = _len_bounds("pairs")
+            total_len = len(paper) + len(repo)
+            if not paper or not repo:
+                return False
+            if not (mn <= total_len <= mx):
+                return False
+            return True
+
+        if "repos" in raw:
+            raw["repos"] = raw["repos"].filter(_filter_repos)
+        if "papers" in raw:
+            raw["papers"] = raw["papers"].filter(_filter_papers)
+        if "pairs" in raw:
+            raw["pairs"] = raw["pairs"].filter(_filter_pairs)
+
+        # --- Domain-level filtering ---------------------------------------- #
+
+        if ds_domains:
+            def _has_domain(ex: Dict[str, Any]) -> bool:
+                meta = ex.get("meta") or {}
+                doms = meta.get("domains") or []
+                if isinstance(doms, str):
+                    doms_list = [doms]
+                else:
+                    try:
+                        doms_list = list(doms)
+                    except Exception:
+                        doms_list = []
+                return any(d in ds_domains for d in doms_list)
+
+            if "repos" in raw:
+                raw["repos"] = raw["repos"].filter(_has_domain)
+            if "papers" in raw:
+                raw["papers"] = raw["papers"].filter(_has_domain)
+            if "pairs" in raw:
+                raw["pairs"] = raw["pairs"].filter(_has_domain)
+
+        # --- Static corpus mixing / re-weighting -------------------------- #
+
+        mix_cfg = ds_cfg.get("corpus_mix") or {}
+        if mix_cfg and any(k in raw for k in ("repos", "papers")) and archetype_name != "contrastive":
+            parts = []
+
+            def _reweight(split_name: str, ds_split):
+                weight = float(mix_cfg.get(split_name, 1.0))
+                if weight <= 0.0:
+                    return None
+                # For weight < 1.0, subsample; for >1.0, oversample up to 3x.
+                n = len(ds_split)
+                if n == 0:
+                    return None
+                target = int(max(1, min(n * max(weight, 0.0), n * 3.0)))
+                if target == n:
+                    return ds_split
+                return ds_split.shuffle(seed=int(training_cfg.get("shuffle_seed", 42))).select(range(target))
+
+            if "repos" in raw:
+                ds_r = _reweight("repos", raw["repos"])
+                if ds_r is not None:
+                    raw["repos"] = ds_r
+            if "papers" in raw:
+                ds_p = _reweight("papers", raw["papers"])
+                if ds_p is not None:
+                    raw["papers"] = ds_p
+
+        # Contrastive models (e.g., C2/C6) should train only on pair records.
+        if archetype_name == "contrastive" and "pairs" in raw:
+            base = raw["pairs"]
+            if eval_split > 0.0:
+                return base.train_test_split(test_size=eval_split)
+            return base
+
+        # Generative/classifier models: mix repo and paper corpora if available.
+        parts = []
+        if "repos" in raw:
+            parts.append(raw["repos"])
+        if "papers" in raw:
+            parts.append(raw["papers"])
+        if not parts:
+            return None
+        mixed = parts[0] if len(parts) == 1 or concatenate_datasets is None else concatenate_datasets(parts)
+        if eval_split > 0.0:
+            return mixed.train_test_split(test_size=eval_split)
+        return mixed
+
     def _build_hf_dataset(self):
+        # Prefer full-corpus HF datasets when corpus_* sources are configured.
+        corpus_ds = self._build_corpus_hf_dataset()
+        if corpus_ds is not None:
+            return corpus_ds
+
         dataset = build_dataset(self.config)
         if not dataset:
             return None
@@ -598,6 +783,8 @@ class Trainer:
     def train(self):
         """Mock train loop to keep CLI end-to-end runnable."""
         archetype = get_archetype(self.config.get("model_id", "")) or {}
+        training_cfg = self.config.get("training", {}) or {}
+
         # Prefer contrastive loop for contrastive archetypes.
         if archetype.get("archetype") == "contrastive":
             try:
@@ -606,6 +793,36 @@ class Trainer:
                     return None
             except Exception as exc:
                 print(f"[warn] contrastive loop failed, falling back: {exc}")
+
+        # Optional multi-phase curriculum over the full corpus: if
+        # training.curriculum is present, iterate phases, adjusting
+        # dataset.corpus_mix and basic training knobs (e.g., max_steps)
+        # per phase while reusing the same backbone/checkpoints.
+        curriculum = training_cfg.get("curriculum") or []
+        if self._should_use_hf_trainer() and curriculum:
+            ds_cfg = self.config.setdefault("dataset", {})
+            orig_mix = dict(ds_cfg.get("corpus_mix") or {})
+            orig_max_steps = training_cfg.get("max_steps", -1)
+            for idx, phase in enumerate(curriculum):
+                phase_name = phase.get("name") or f"phase_{idx}"
+                phase_mix = phase.get("corpus_mix")
+                if phase_mix is not None:
+                    ds_cfg["corpus_mix"] = phase_mix
+                phase_max_steps = phase.get("max_steps")
+                if phase_max_steps is not None:
+                    training_cfg["max_steps"] = phase_max_steps
+                print(f"[train] curriculum {phase_name}: corpus_mix={ds_cfg.get('corpus_mix')} max_steps={training_cfg.get('max_steps')}")
+                # Run one HF-Trainer pass for this phase; subsequent phases
+                # will continue from the latest checkpoint on disk.
+                try:
+                    if self._train_with_hf_trainer():
+                        print(f"[train] completed curriculum phase {phase_name}.")
+                except Exception as exc:
+                    print(f"[warn] curriculum phase {phase_name} failed, continuing: {exc}")
+            # Restore original config knobs for any follow-up calls.
+            ds_cfg["corpus_mix"] = orig_mix
+            training_cfg["max_steps"] = orig_max_steps
+            return None
 
         if self._should_use_hf_trainer():
             try:

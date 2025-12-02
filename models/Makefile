@@ -41,3 +41,8 @@ preprocess.concepts:
 .PHONY: preprocess.graphs
 preprocess.graphs:
 	PYTHONPATH=$(PYTHONPATH) python -m scripts.library_repo_graph_export --library-root /data/repositories --export-root /data/repository_library/exports
+
+.PHONY: build.corpus
+build.corpus:
+	# Build unified corpora from repos, structured PDFs, and alignment pairs.
+	PYTHONPATH=$(PYTHONPATH) python -m models.scripts.build_corpus --repos-chunks-dir exports/repos_chunks --pdfs-structured-dir exports/pdfs_structured --alignment-path exports/paper_repo_align.jsonl --out-dir exports/corpus

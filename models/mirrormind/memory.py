@@ -30,6 +30,46 @@ class Episode:
     sparse: Dict[str, int] = field(default_factory=dict)
 
 
+class EpisodeType:
+    """
+    Canonical episode type labels used across the codebase.
+
+    These mirror the taxonomy in models/paper.md Section 3.1 while remaining
+    backwards-compatible with existing string uses.
+    """
+
+    # Repository-focused types
+    FUNCTION_DEF = "function_def"
+    CLASS_DEF = "class_def"
+    TEST_CASE = "test_case"
+    COMMIT_MESSAGE = "commit_message"
+    ISSUE_COMMENT = "issue_comment"
+    DOC_PARAGRAPH = "doc_paragraph"
+    TITLE = "title"
+
+    # Paper-focused types
+    ABSTRACT_CHUNK = "abstract_chunk"
+    BODY_CHUNK = "body_chunk"
+    EQUATION_BLOCK = "equation_block"
+    PSEUDO_CODE = "pseudo_code"
+
+    @classmethod
+    def all(cls) -> Sequence[str]:
+        return [
+            cls.FUNCTION_DEF,
+            cls.CLASS_DEF,
+            cls.TEST_CASE,
+            cls.COMMIT_MESSAGE,
+            cls.ISSUE_COMMENT,
+            cls.DOC_PARAGRAPH,
+            cls.TITLE,
+            cls.ABSTRACT_CHUNK,
+            cls.BODY_CHUNK,
+            cls.EQUATION_BLOCK,
+            cls.PSEUDO_CODE,
+        ]
+
+
 @dataclass
 class SemanticSummary:
     """Trajectory summary over a time window."""
@@ -51,6 +91,10 @@ class EpisodicMemoryStore:
 
     def __init__(self) -> None:
         self._by_entity: Dict[str, List[Episode]] = {}
+        # Optional reverse index from ProgramGraph node ID / file URI to
+        # episodes that mention it in graph_context. This enables simple
+        # ProgramGraph-aware episodic retrieval (see query(graph_nodes=...)).
+        self._by_node: Dict[str, List[Episode]] = {}
         self.dense_index: Optional[DenseIndex] = None
         self.sparse_index: Optional[SparseIndex] = None
         self.faiss_index: Optional[FaissIndex] = None
@@ -59,6 +103,8 @@ class EpisodicMemoryStore:
     def add(self, episode: Episode) -> None:
         bucket = self._by_entity.setdefault(episode.entity_id, [])
         bucket.append(episode)
+        for node_id in episode.graph_context:
+            self._by_node.setdefault(str(node_id), []).append(episode)
 
     def entities(self) -> List[str]:
         """Return all entity IDs present in the store."""
@@ -79,6 +125,7 @@ class EpisodicMemoryStore:
         types: Optional[Sequence[str]] = None,
         type_weights: Optional[Dict[str, float]] = None,
         time_range: Optional[Tuple[int, int]] = None,
+        graph_nodes: Optional[Sequence[str]] = None,
         top_k: int = 5,
     ) -> List[Episode]:
         """
@@ -107,6 +154,14 @@ class EpisodicMemoryStore:
                 except Exception:
                     t_val = None
                 if t_val is None or (t0 <= t_val <= t1):
+                    filtered.append(ep)
+            candidates = filtered
+
+        if graph_nodes:
+            node_set = {str(n) for n in graph_nodes}
+            filtered = []
+            for ep in candidates:
+                if any(str(n) in node_set for n in ep.graph_context):
                     filtered.append(ep)
             candidates = filtered
 
@@ -458,3 +513,67 @@ def build_semantic_summaries(
         dense=dense_vec,
     )
     return [summary]
+
+
+def build_temporal_semantic_summaries(
+    entity_id: str,
+    episodes: Sequence[Episode],
+    *,
+    summarize_fn: Optional[Callable[[str], str]] = None,
+    scope_label: str = "temporal",
+    max_windows: int = 4,
+    min_episodes_per_window: int = 10,
+) -> List[SemanticSummary]:
+    """
+    Temporal variant of build_semantic_summaries that produces multiple
+    SemanticSummary windows per entity by sharding episodes along time.
+    This is primarily intended for commit trajectories (see models/paper.md
+    Section 3.2) but is generic enough to work for any time-stamped episodes.
+    """
+    if not episodes:
+        return []
+
+    # Sort episodes by time (when available); keep ones without a usable time
+    # at the end so they are still summarized.
+    def _time_key(ep: Episode) -> Tuple[int, int]:
+        try:
+            t_val = int(str(ep.time)[:10]) if ep.time is not None else None
+        except Exception:
+            t_val = None
+        # Use large positive sentinel for missing timestamps so they sort last.
+        return (0 if t_val is not None else 1, t_val or 0)
+
+    sorted_eps = sorted(episodes, key=_time_key)
+    n = len(sorted_eps)
+    if n <= min_episodes_per_window:
+        # Too few episodes; fall back to a single-span summary.
+        return build_semantic_summaries(
+            entity_id,
+            sorted_eps,
+            summarize_fn=summarize_fn,
+            scope_label=scope_label,
+            include_raw=False,
+        )
+
+    # Decide number of windows: up to max_windows, but ensure each window
+    # has at least min_episodes_per_window episodes.
+    approx_windows = max(1, min(max_windows, n // max(min_episodes_per_window, 1)))
+    window_size = max(1, n // approx_windows)
+
+    summaries: List[SemanticSummary] = []
+    for i in range(0, n, window_size):
+        chunk = sorted_eps[i : i + window_size]
+        if not chunk:
+            continue
+        # Re-use the single-window helper but override scope_label to encode
+        # the temporal window index so callers can distinguish windows.
+        sub_scope = f"{scope_label}:window_{len(summaries)}"
+        subs = build_semantic_summaries(
+            entity_id,
+            chunk,
+            summarize_fn=summarize_fn,
+            scope_label=sub_scope,
+            include_raw=False,
+        )
+        summaries.extend(subs)
+    return summaries

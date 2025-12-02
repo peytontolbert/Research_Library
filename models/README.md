@@ -8,6 +8,36 @@ This `models/` directory is the home for **all model-building code** for your ar
 
 ---
 
+### Corpus Pipeline for Repos + Papers
+
+The core repo/paper corpus used by the training stack is built in three stages:
+
+- **Preprocess PDFs**: `make -C models preprocess.pdfs`  
+  - Uses `models.scripts.preprocess_pdfs` to write structured shards under `exports/pdfs_structured/`.
+- **Preprocess repos**: `make -C models preprocess.repos`  
+  - Uses `models.scripts.preprocess_repos` to write code/doc chunks under `exports/repos_chunks/`.
+- **Build alignment pairs (optional but recommended)**: `make -C models preprocess.align`  
+  - Uses `models.scripts.preprocess_alignment` to write `exports/paper_repo_align.jsonl`.
+- **Build unified corpora**: `make -C models build.corpus`  
+  - Uses `models.scripts.build_corpus` to write sharded JSONL corpora under `exports/corpus/`:
+    - `exports/corpus/repos/repo_*.jsonl` (code/doc chunks),
+    - `exports/corpus/papers/paper_*.jsonl` (paper chunks),
+    - `exports/corpus/pairs/pair_*.jsonl` (paper↔repo pairs, if available).
+
+Each corpus record is a small JSON object with a `source` field (`repo_chunk`, `paper_chunk`, or `paper_repo_pair`), a primary text payload (`text` or `paper_text`/`repo_text`), and a `meta` dict. Tokenization and batching for specific models are handled by `models.shared.training` and the experiment configs in `models/experiments/`.
+
+For **full-corpus training** over these shards:
+
+- Point an experiment’s `dataset.sources` at the corpus keys, for example:
+  - `"sources": ["corpus_repos", "corpus_papers"]` for mixed code+paper language modeling,
+  - `"sources": ["corpus_pairs"]` for contrastive alignment models.
+- Optionally configure:
+  - `dataset.quality_filters` – min/max character lengths per split, basic path-based noise filters for repos (e.g., skip `site-packages`, `.venv`, `__pycache__`).
+  - `dataset.corpus_mix` – static re-weighting of `repos` vs `papers` (e.g., `"corpus_mix": {"repos": 1.0, "papers": 0.5}`).
+- The `Trainer` in `models/shared/training.py` will use `datasets.load_dataset("json", data_files=...)` over `exports/corpus/**` (Arrow-backed) and apply these filters/mix settings before handing data to HF Trainer.
+
+---
+
 ### Tier Structure (High-Level)
 
 The models are grouped into tiers, as documented in `models.md`:

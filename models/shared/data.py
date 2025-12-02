@@ -15,6 +15,7 @@ import glob
 import re
 import gzip
 import itertools
+import hashlib
 
 from models.shared.archetypes import get_archetype
 from models.shared.graph_data import (
@@ -209,6 +210,111 @@ def _load_paper_repo_alignment(max_samples: int, path: Path = Path("exports/pape
     except Exception:
         return []
     return samples[:max_samples]
+
+
+def _load_corpus_split(
+    split: str,
+    max_samples: int,
+    base_dir: Path = Path("exports/corpus"),
+) -> List[Dict[str, Any]]:
+    """
+    Load prebuilt corpus shards from exports/corpus created by models.scripts.build_corpus.
+
+    Layout:
+      exports/corpus/
+        repos/repo_*.jsonl
+        papers/paper_*.jsonl
+        pairs/pair_*.jsonl
+
+    Returns a list of simple dict records shaped to match the rest of build_dataset.
+    """
+    split_dir = base_dir / split
+    if not split_dir.exists():
+        return []
+    records: List[Dict[str, Any]] = []
+    # Use a lightweight per-split hash set to avoid trivial duplicates.
+    seen_hashes: set[str] = set()
+
+    def _hash_payload(payload: str) -> str:
+        h = hashlib.sha1()
+        h.update(payload.encode("utf-8", errors="ignore"))
+        return h.hexdigest()
+
+    pattern = {
+        "repos": "repo_*.jsonl",
+        "papers": "paper_*.jsonl",
+        "pairs": "pair_*.jsonl",
+    }.get(split, "*.jsonl")
+
+    for shard in sorted(split_dir.glob(pattern)):
+        try:
+            with shard.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if len(records) >= max_samples:
+                        return records
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    source = obj.get("source") or ""
+                    if split == "repos" or source == "repo_chunk":
+                        text = str(obj.get("text") or "").strip()
+                        if not text:
+                            continue
+                        hval = _hash_payload(text)
+                        if hval in seen_hashes:
+                            continue
+                        seen_hashes.add(hval)
+                        meta = obj.get("meta") or {}
+                        records.append(
+                            {
+                                "text": text,
+                                "label": 0,
+                                "repo_id": meta.get("repo_id"),
+                                "path": meta.get("path"),
+                                "offset": meta.get("offset", 0),
+                            }
+                        )
+                    elif split == "papers" or source == "paper_chunk":
+                        text = str(obj.get("text") or "").strip()
+                        if not text:
+                            continue
+                        hval = _hash_payload(text)
+                        if hval in seen_hashes:
+                            continue
+                        seen_hashes.add(hval)
+                        meta = obj.get("meta") or {}
+                        records.append(
+                            {
+                                "text": text,
+                                "label": 0,
+                                "pdf_path": meta.get("pdf_path"),
+                            }
+                        )
+                    elif split == "pairs" or source == "paper_repo_pair":
+                        paper = str(obj.get("paper_text") or "").strip()
+                        repo = str(obj.get("repo_text") or "").strip()
+                        if not paper or not repo:
+                            continue
+                        label = int(obj.get("label") or 0)
+                        score = float(obj.get("score") or 0.0)
+                        records.append(
+                            {
+                                "text_a": paper,
+                                "text_b": repo,
+                                "label": label,
+                                "score": score,
+                            }
+                        )
+        except Exception:
+            continue
+
+    return records[:max_samples]
 
 
 def _sample_repos(max_samples: int) -> List[Dict[str, Any]]:
@@ -459,6 +565,17 @@ def build_dataset(config: Dict[str, Any]):
                 # If alignment pairs exist, skip the generic PDF/repo mixing for these models.
                 return samples[:max_samples]
         # Supplemental sources: prefer structured shards if available.
+        # Prefer explicit corpus shards when requested; they are the unified
+        # view built by models.scripts.build_corpus and scale better than
+        # on-the-fly sampling for large runs.
+        if "corpus_repos" in sources:
+            samples.extend(_load_corpus_split("repos", max_samples))
+        if "corpus_papers" in sources:
+            samples.extend(_load_corpus_split("papers", max_samples))
+        if "corpus_pairs" in sources:
+            samples.extend(_load_corpus_split("pairs", max_samples))
+        # Fallback to raw structured PDFs / direct PDF extraction when corpus
+        # shards are not used.
         if "arxiv_pdfs_structured" in sources or "arxiv_pdfs" in sources:
             structured_records = list(_iter_structured_pdfs(structured_pdf_dir, max_samples))
             if structured_records:

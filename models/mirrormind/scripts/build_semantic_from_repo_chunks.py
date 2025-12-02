@@ -16,9 +16,15 @@ import argparse
 import json
 from glob import glob
 from pathlib import Path
-from typing import Dict, Sequence, Optional, Callable
+from typing import Dict, Sequence, Optional, Callable, Any
 
-from models.mirrormind.memory import EpisodicMemoryStore, Episode, SemanticMemoryStore, build_semantic_summaries
+from models.mirrormind.memory import (
+    EpisodicMemoryStore,
+    Episode,
+    SemanticMemoryStore,
+    build_semantic_summaries,
+    EpisodeType,
+)
 from models.mirrormind.llm import safe_build_llm
 
 
@@ -38,9 +44,32 @@ def _repo_id_from_path(path: str) -> str:
     return p.parent.name or "unknown"
 
 
+def _load_manifest_meta(manifest_path: Path) -> Dict[str, Any]:
+    """
+    Load the library manifest if present and return the `repos` map.
+    This lets us attach coarse timestamps to episodes based on when a
+    repo was last indexed or snapshotted.
+    """
+    if not manifest_path.exists():
+        return {}
+    try:
+        with manifest_path.open("r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except Exception:
+        return {}
+    repos = obj.get("repos")
+    return repos if isinstance(repos, dict) else {}
+
+
 def _load_episodic_from_chunks(paths: Sequence[Path]) -> EpisodicMemoryStore:
     store = EpisodicMemoryStore()
     per_repo_count: Dict[str, int] = {}
+
+    # Best-effort coarse temporal signal per repo: use last_indexed_at or
+    # snapshot_mtime from the library manifest, falling back to None.
+    manifest_path = Path("/data/repository_library/exports/_manifest.json")
+    repos_meta = _load_manifest_meta(manifest_path)
+
     for path in paths:
         with path.open("r", encoding="utf-8") as f:
             for line in f:
@@ -56,11 +85,18 @@ def _load_episodic_from_chunks(paths: Sequence[Path]) -> EpisodicMemoryStore:
                 text = obj.get("code") or ""
                 if not text:
                     continue
+
+                meta = repos_meta.get(repo_id, {}) if isinstance(repos_meta, dict) else {}
+                # Prefer explicit last_indexed_at; fall back to snapshot_mtime if present.
+                t_val = meta.get("last_indexed_at") or meta.get("repo_state", {}).get("snapshot_mtime")
+                # Keep time as a string so Episodic/Semantic stores can interpret it as an integer-like timestamp prefix.
+                time_str: Optional[str] = str(int(t_val)) if isinstance(t_val, (int, float)) else None
+
                 ep = Episode(
                     id=f"{repo_id}:{per_repo_count[repo_id]}",
                     entity_id=repo_id,
-                    time=None,
-                    type="doc_paragraph",
+                    time=time_str,
+                    type=EpisodeType.DOC_PARAGRAPH,
                     text=text,
                     graph_context=[],
                     dense=[float(len(text))],

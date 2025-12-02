@@ -5,15 +5,37 @@ This module provides a minimal PIANO-style agent loop that rides on top of the M
 - `state.py` – shared `AgentState` holding working memory + pointers to RepoTwin/PaperTwin/DomainAgent.
 - `controller.py` – `CognitiveController` coherence bottleneck that emits a high-level `Intent`.
 - `modules.py` – stub modules for goal generation, skill execution, action awareness, talking, social, and context building via MirrorMind.
-- `agent.py` – `PianoAgent` that ties everything together: summarize state → decide intent → call module → log awareness.
+- `agent.py` – `PianoAgent` that ties everything together: summarize state (including MirrorMind LTM) → decide intent → call module → log awareness.
+- `swarm.py` – `PianoSwarm` helper to spin up multiple `PianoAgent` instances with roles and repo/paper specializations and compute simple “civilization-style” metrics (intent distributions, specialization, rule violations, meme counts).
 
-Usage (stub):
+Usage (single agent, stub):
 ```python
 from models.piano import PianoAgent
 
 agent = PianoAgent(task="fix failing optimizer tests", repo_id="AgentLab")
 step_out = agent.step()
 print(step_out)
+```
+```
+
+Usage (small swarm, stub):
+
+```python
+from models.piano.swarm import PianoSwarm
+
+swarm = PianoSwarm(
+    task="stabilize optimizer experiments and summarize related papers",
+    agents=[
+        {"role": "optimizer_engineer", "repo_id": "MyOptimizerRepo", "paper_id": None},
+        {"role": "paper_summarizer", "repo_id": None, "paper_id": "arxiv:2411.00114"},
+    ],
+    role_rules={
+        "optimizer_engineer": ["edit_code", "run_tests", "run_benchmarks"],  # type: ignore[list-item]
+        "paper_summarizer": ["read_paper", "talk"],  # type: ignore[list-item]
+    },
+)
+metrics = swarm.run_rounds(steps_per_agent=3)
+print(metrics)
 ```
 
 Key pieces now implemented:

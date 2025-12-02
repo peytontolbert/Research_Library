@@ -128,7 +128,18 @@ class SkillExecutor:
         return f"[read_paper] {paper_ctx.get('episodic_context','')[:200]}"
 
     def inspect_graph(self, concept: str) -> str:
-        return f"[query_graph:{concept}]"
+        """
+        Query the concept/domain graph for a high-level view of a topic.
+
+        This uses DomainAgent.search_concepts so the result is grounded in the
+        unified repo+paper concept graph rather than a pure string stub.
+        """
+        try:
+            concepts = self.domain_agent.search_concepts(concept, top_k=4)
+            names = [c.get("name") or c.get("concept_id") for c in concepts if isinstance(c, dict)]
+            return f"[query_graph:{concept}] " + ", ".join([n for n in names if n][:8])
+        except Exception as exc:
+            return f"[query_graph_error:{concept}] {exc}"
 
     def graph_neighbors(self, concept: str) -> str:
         """Graph tool adapter using DomainAgent or injected graph client."""

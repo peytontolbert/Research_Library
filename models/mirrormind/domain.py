@@ -7,12 +7,63 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Callable
+from typing import Dict, List, Optional, Sequence, Tuple, Callable, Any
 import json
 import math
 import random
 
 from models.mirrormind.embeddings import TextEmbedder
+
+
+_DOMAIN_KEYWORDS_CACHE: Optional[Dict[str, List[str]]] = None
+
+
+def _load_domain_keywords(path: Path = Path("models/mirrormind/domain_keywords.json")) -> Dict[str, List[str]]:
+    """
+    Load domain→keyword mappings from a JSON file, with a safe fallback.
+
+    The JSON is expected to look like:
+      {
+        "deep-learning": ["transformer", "attention", ...],
+        "compilers": ["compiler", "llvm", ...],
+        ...
+      }
+    """
+    global _DOMAIN_KEYWORDS_CACHE
+    if _DOMAIN_KEYWORDS_CACHE is not None:
+        return _DOMAIN_KEYWORDS_CACHE
+
+    default: Dict[str, List[str]] = {
+        "deep-learning": ["transformer", "attention", "llm", "bert", "gpt", "diffusion", "neural", "cnn"],
+        "compilers": ["compiler", "llvm", "bytecode", "parser", "interpreter"],
+        "rl-control": ["reinforcement", "rl", "reward", "policy", "environment", "gym", "agent", "trajectory", "control"],
+    }
+
+    if not path.exists():
+        _DOMAIN_KEYWORDS_CACHE = default
+        return default
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            obj: Any = json.load(f)
+    except Exception:
+        _DOMAIN_KEYWORDS_CACHE = default
+        return default
+
+    if not isinstance(obj, dict):
+        _DOMAIN_KEYWORDS_CACHE = default
+        return default
+
+    parsed: Dict[str, List[str]] = {}
+    for dom, kws in obj.items():
+        if not isinstance(dom, str):
+            continue
+        if isinstance(kws, list):
+            parsed[dom] = [str(k).lower() for k in kws if isinstance(k, (str, bytes))]
+    if not parsed:
+        _DOMAIN_KEYWORDS_CACHE = default
+        return default
+    _DOMAIN_KEYWORDS_CACHE = parsed
+    return parsed
 
 
 @dataclass
@@ -152,13 +203,130 @@ class DomainGraph:
                             edge_map.append("appears_in_same_paper_as")
                         if "co_occurs_with" not in edge_map:
                             edge_map.append("co_occurs_with")
+        # Add lightweight taxonomic and domain-level structure on top of the
+        # co-occurrence graph. This remains heuristic but helps close the
+        # gap with the spec's is_subconcept_of and domain pseudo-nodes.
+        self._attach_taxonomy_edges()
+        self._attach_domain_pseudo_nodes()
 
-        # Attach simple text embeddings to each concept name for semantic search.
+        # Attach simple text embeddings to each concept name (including
+        # domain pseudo-nodes) for semantic search.
         if self.nodes:
             names = [node.name for node in self.nodes.values()]
             vecs = self._embedder.encode(names)
             for node, vec in zip(self.nodes.values(), vecs):
                 node.embedding = vec
+
+    def _attach_taxonomy_edges(self) -> None:
+        """
+        Heuristically add `is_subconcept_of` / `has_subconcept` edges by
+        interpreting dotted, slash-separated, or scoped identifiers as
+        simple hierarchies, e.g.:
+
+            "foo.bar" -> parent "foo"
+            "pkg/module" -> parent "pkg"
+
+        This runs in O(N) over nodes and avoids quadratic name comparisons.
+        """
+        for cid, node in list(self.nodes.items()):
+            parents: List[str] = []
+            for raw in (node.id, node.name):
+                if not raw:
+                    continue
+                # Treat common separators as hierarchical boundaries.
+                for sep in (".", "/", "::"):
+                    if sep in raw:
+                        parent = raw.rsplit(sep, 1)[0]
+                        if parent and parent != raw:
+                            parents.append(parent)
+            for pid in parents:
+                if pid not in self.nodes or pid == cid:
+                    continue
+                parent_node = self.nodes[pid]
+                # Undirected neighbor links.
+                if pid not in node.neighbors:
+                    node.neighbors.append(pid)
+                if cid not in parent_node.neighbors:
+                    parent_node.neighbors.append(cid)
+                # Directed edge types: child -> parent is_subconcept_of, parent -> child has_subconcept.
+                child_edges = node.edge_types.setdefault(pid, [])
+                if "is_subconcept_of" not in child_edges:
+                    child_edges.append("is_subconcept_of")
+                parent_edges = parent_node.edge_types.setdefault(cid, [])
+                if "has_subconcept" not in parent_edges:
+                    parent_edges.append("has_subconcept")
+
+    def _attach_domain_pseudo_nodes(self) -> None:
+        """
+        Create a small set of domain-level pseudo-nodes and connect concepts
+        to them via `belongs_to_domain` / `domain_has_concept` edges.
+
+        Domains and keywords are heuristic but cheap:
+        - deep-learning: transformer, attention, llm, bert, gpt, diffusion
+        - compilers: compiler, llvm, bytecode, parser, interpreter
+        - rl-control: reward, policy, environment, gym, agent, trajectory, control
+        """
+        if not self.nodes:
+            return
+
+        domain_keywords = _load_domain_keywords()
+
+        # Ensure domain pseudo-nodes exist.
+        domain_nodes: Dict[str, ConceptNode] = {}
+        for dom, _ in domain_keywords.items():
+            dom_id = f"__domain:{dom}__"
+            node = self.nodes.get(dom_id)
+            if node is None:
+                node = ConceptNode(id=dom_id, name=dom.replace("-", " ").title())
+                self.nodes[dom_id] = node
+            domain_nodes[dom] = node
+
+        # Map each concept to zero or more domains based on name tokens.
+        concept_domains: Dict[str, List[str]] = {}
+        for cid, node in self.nodes.items():
+            name_l = node.name.lower()
+            toks = set(name_l.split())
+            assigned: List[str] = []
+            for dom, kws in domain_keywords.items():
+                if any((kw in toks) or (kw in name_l) for kw in kws):
+                    assigned.append(dom)
+            if assigned:
+                concept_domains[cid] = assigned
+                for dom in assigned:
+                    dom_node = domain_nodes[dom]
+                    # Undirected neighbor link domain <-> concept.
+                    if cid not in dom_node.neighbors:
+                        dom_node.neighbors.append(cid)
+                    if dom_node.id not in node.neighbors:
+                        node.neighbors.append(dom_node.id)
+                    # Edge types.
+                    d_edges = dom_node.edge_types.setdefault(cid, [])
+                    if "domain_has_concept" not in d_edges:
+                        d_edges.append("domain_has_concept")
+                    c_edges = node.edge_types.setdefault(dom_node.id, [])
+                    if "belongs_to_domain" not in c_edges:
+                        c_edges.append("belongs_to_domain")
+
+        # Cross-domain connectors: if a single concept maps to multiple
+        # domains, link those domains together to reflect shared topics.
+        for _, doms in concept_domains.items():
+            if len(doms) < 2:
+                continue
+            for i in range(len(doms)):
+                for j in range(i + 1, len(doms)):
+                    da, db = doms[i], doms[j]
+                    na = domain_nodes[da]
+                    nb = domain_nodes[db]
+                    if nb.id not in na.neighbors:
+                        na.neighbors.append(nb.id)
+                    if na.id not in nb.neighbors:
+                        nb.neighbors.append(na.id)
+                    eab = na.edge_types.setdefault(nb.id, [])
+                    if "cross_domain_connector" not in eab:
+                        eab.append("cross_domain_connector")
+                    eba = nb.edge_types.setdefault(na.id, [])
+                    if "cross_domain_connector" not in eba:
+                        eba.append("cross_domain_connector")
 
     def search(self, query: str, top_k: int = 8) -> List[Tuple[ConceptNode, float]]:
         q_tokens = set(query.lower().split())
@@ -241,6 +409,52 @@ class DomainGraph:
 
         return [(rid, "repo", float(score)) for score, rid in scored[:k]]
 
+    def repo_neighbors(self, repo_id: str, k: int = 8) -> List[Tuple[str, float]]:
+        """
+        Lightweight RepoGraph view induced from the ConceptGraph:
+        two repos are neighbors if they share concepts, scored by
+        shared-concept frequency.
+        """
+        if not repo_id:
+            return []
+        co_counts: Dict[str, int] = {}
+        for node in self.nodes.values():
+            if repo_id not in node.repos:
+                continue
+            for rid in node.repos:
+                if rid == repo_id:
+                    continue
+                co_counts[rid] = co_counts.get(rid, 0) + 1
+        if not co_counts:
+            return []
+        max_c = max(co_counts.values()) or 1
+        scored: List[Tuple[str, float]] = [(rid, count / max_c) for rid, count in co_counts.items()]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:k]
+
+    def paper_neighbors(self, paper_id: str, k: int = 8) -> List[Tuple[str, float]]:
+        """
+        Lightweight PaperGraph view induced from the ConceptGraph:
+        two papers are neighbors if they share concepts, scored by
+        shared-concept frequency.
+        """
+        if not paper_id:
+            return []
+        co_counts: Dict[str, int] = {}
+        for node in self.nodes.values():
+            if paper_id not in node.papers:
+                continue
+            for pid in node.papers:
+                if pid == paper_id:
+                    continue
+                co_counts[pid] = co_counts.get(pid, 0) + 1
+        if not co_counts:
+            return []
+        max_c = max(co_counts.values()) or 1
+        scored: List[Tuple[str, float]] = [(pid, count / max_c) for pid, count in co_counts.items()]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:k]
+
 
 class DomainAgent:
     """LLM-friendly wrapper exposing DomainGraph tools."""
@@ -305,3 +519,19 @@ class DomainAgent:
             except Exception:
                 pass
         return self.domain_graph.experts_for_concept(concept_id, k=k)
+
+    def get_repo_neighbors(self, repo_id: str, k: int = 8) -> List[Dict[str, object]]:
+        """
+        Expose a simple RepoGraph-style neighborhood using the underlying
+        DomainGraph. Each neighbor is a repo_id with an associated score.
+        """
+        neighbors = self.domain_graph.repo_neighbors(repo_id, k=k)
+        return [{"repo_id": rid, "score": float(score)} for rid, score in neighbors]
+
+    def get_paper_neighbors(self, paper_id: str, k: int = 8) -> List[Dict[str, object]]:
+        """
+        Expose a simple PaperGraph-style neighborhood using the underlying
+        DomainGraph. Each neighbor is a paper_id with an associated score.
+        """
+        neighbors = self.domain_graph.paper_neighbors(paper_id, k=k)
+        return [{"paper_id": pid, "score": float(score)} for pid, score in neighbors]
