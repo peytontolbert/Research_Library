@@ -52,10 +52,11 @@ def _summarize_repo(repo: RepoInfo) -> Dict[str, Any]:
 def _select_repos(
     *,
     library_root: str,
+    extra_library_roots: Optional[Sequence[str]] = None,
     only_repo_ids: Optional[Sequence[str]] = None,
     limit: Optional[int] = None,
 ) -> List[RepoInfo]:
-    repos = discover_repositories(root=library_root)
+    repos = discover_repositories(root=library_root, roots=extra_library_roots)
     if only_repo_ids:
         wanted = {r for r in only_repo_ids}
         repos = [r for r in repos if r.repo_id in wanted]
@@ -80,6 +81,15 @@ def main() -> None:
         help=(
             "Root directory that contains individual repositories "
             f"(default: {DEFAULT_LIBRARY_ROOT})."
+        ),
+    )
+    parser.add_argument(
+        "--extra-library-root",
+        action="append",
+        dest="extra_library_roots",
+        help=(
+            "Additional root directory to scan for repositories. "
+            "May be passed multiple times."
         ),
     )
     parser.add_argument(
@@ -110,6 +120,7 @@ def main() -> None:
     library_root = os.path.abspath(args.library_root)
     repos = _select_repos(
         library_root=library_root,
+        extra_library_roots=args.extra_library_roots,
         only_repo_ids=args.repo_ids,
         limit=None if args.repo_ids else args.limit,
     )
@@ -135,5 +146,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 

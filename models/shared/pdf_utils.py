@@ -41,6 +41,12 @@ except Exception:  # pragma: no cover - optional dependency
 _CLIP_CACHE = None  # (processor, model)
 
 
+def _truncate_text(text: str, max_chars: int) -> str:
+    if max_chars is None or int(max_chars) <= 0:
+        return text
+    return text[: int(max_chars)]
+
+
 def _get_clip():
     """Lazy-load CLIP model/processor if available locally."""
     global _CLIP_CACHE
@@ -62,10 +68,10 @@ def extract_pdf_text(path: str, *, max_chars: int = 5000) -> str:
     p = Path(path)
     if p.suffix.lower() != ".pdf":
         try:
-            return p.read_text(encoding="utf-8")[:max_chars]
+            return _truncate_text(p.read_text(encoding="utf-8"), max_chars)
         except Exception:
             try:
-                return p.read_bytes().decode("latin-1", errors="ignore")[:max_chars]
+                return _truncate_text(p.read_bytes().decode("latin-1", errors="ignore"), max_chars)
             except Exception:
                 return ""
 
@@ -79,7 +85,7 @@ def extract_pdf_text(path: str, *, max_chars: int = 5000) -> str:
             timeout=30,
         )
         if proc.stdout:
-            return proc.stdout[:max_chars]
+            return _truncate_text(proc.stdout, max_chars)
     except Exception:
         pass
 
@@ -88,18 +94,18 @@ def extract_pdf_text(path: str, *, max_chars: int = 5000) -> str:
             doc = fitz.open(p)
             parts = []
             for page in doc:
-                if len("".join(parts)) >= max_chars:
+                if max_chars and int(max_chars) > 0 and len("".join(parts)) >= int(max_chars):
                     break
                 parts.append(page.get_text("text"))
             doc.close()
             if parts:
-                return "".join(parts)[:max_chars]
+                return _truncate_text("".join(parts), max_chars)
         except Exception:
             pass
 
     if PyPDF2 is None:
         try:
-            return p.read_bytes().decode("latin-1", errors="ignore")[:max_chars]
+            return _truncate_text(p.read_bytes().decode("latin-1", errors="ignore"), max_chars)
         except Exception:
             return f"PDF_PATH::{path}"
 
@@ -108,14 +114,14 @@ def extract_pdf_text(path: str, *, max_chars: int = 5000) -> str:
         with p.open("rb") as fh:
             reader = PyPDF2.PdfReader(fh)
             for page in reader.pages:
-                if len("".join(text_parts)) >= max_chars:
+                if max_chars and int(max_chars) > 0 and len("".join(text_parts)) >= int(max_chars):
                     break
                 try:
                     page_text = page.extract_text() or ""
                     text_parts.append(page_text)
                 except Exception:
                     continue
-        return "".join(text_parts)[:max_chars]
+        return _truncate_text("".join(text_parts), max_chars)
     except Exception:
         return f"PDF_PATH::{path}"
 

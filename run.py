@@ -91,9 +91,73 @@ logger = logging.getLogger("repository_library.server")
 _LLM_MODEL = None
 _LLM_TOKENIZER = None
 _QA_INDEX_CACHE: Dict[str, Any] = {}
+_COARSE_LANE_RETRIEVER = None
 
 
 ARXIV_PDF_ROOT = Path("/arxiv/pdfs")
+ARXIV_PDF_CACHE_ROOT = Path(__file__).resolve().parent / "exports" / "arxiv_pdfs"
+
+
+def _all_local_arxiv_pdf_roots(preferred_root: Optional[Path] = None) -> List[Path]:
+    roots: List[Path] = []
+    if preferred_root is not None:
+        roots.append(preferred_root)
+    roots.extend([ARXIV_PDF_ROOT, ARXIV_PDF_CACHE_ROOT])
+    deduped: List[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        if root in seen:
+            continue
+        seen.add(root)
+        deduped.append(root)
+    return deduped
+
+
+def _can_write_arxiv_pdf_root(root: Path) -> bool:
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        probe = root / ".codex_write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return True
+    except Exception:
+        return False
+
+
+def _choose_arxiv_pdf_download_root(preferred_root: Optional[Path] = None) -> Path:
+    for root in _all_local_arxiv_pdf_roots(preferred_root):
+        if _can_write_arxiv_pdf_root(root):
+            return root
+    return preferred_root or ARXIV_PDF_CACHE_ROOT
+
+
+def _local_arxiv_pdf_candidates(pdf_id: str) -> List[Path]:
+    """
+    Candidate local PDF paths for a normalized arXiv id.
+
+    We support both legacy root-level storage:
+      /arxiv/pdfs/<id>.pdf
+    and bucketed storage:
+      /arxiv/pdfs/YYMM/<id>.pdf
+    """
+    norm_id = str(pdf_id or "").strip().split("/")[-1]
+    if not norm_id:
+        return []
+
+    candidates: List[Path] = []
+    yymm = norm_id[:4]
+    for root in _all_local_arxiv_pdf_roots():
+        if len(yymm) == 4 and yymm.isdigit():
+            candidates.append(root / yymm / f"{norm_id}.pdf")
+        candidates.append(root / f"{norm_id}.pdf")
+    return candidates
+
+
+def _find_local_arxiv_pdf(pdf_id: str) -> Optional[Path]:
+    for candidate in _local_arxiv_pdf_candidates(pdf_id):
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def _download_arxiv_pdf(arxiv_id: str, *, timeout: int = 60) -> bool:
@@ -113,18 +177,20 @@ def _download_arxiv_pdf(arxiv_id: str, *, timeout: int = 60) -> bool:
     if not norm_id:
         raise ValueError("invalid arxiv_id")
 
+    download_root = _choose_arxiv_pdf_download_root()
+
     # Decide on output directory: prefer /arxiv/pdfs/YYMM/<id>.pdf when possible.
     yymm = norm_id[:4]
     if len(yymm) == 4 and yymm.isdigit():
-        out_dir = ARXIV_PDF_ROOT / yymm
+        out_dir = download_root / yymm
     else:
-        out_dir = ARXIV_PDF_ROOT
+        out_dir = download_root
     out_dir.mkdir(parents=True, exist_ok=True)
 
     pdf_url = f"https://export.arxiv.org/pdf/{norm_id}.pdf"
     out_path = out_dir / f"{norm_id}.pdf"
 
-    if out_path.exists():
+    if _find_local_arxiv_pdf(norm_id) is not None:
         return False
 
     resp = requests.get(pdf_url, stream=True, timeout=timeout)
@@ -167,6 +233,47 @@ def _compute_repo_commit_count(repo_root: str, *, timeout: float = 15.0) -> Opti
         return int(out)
     except ValueError:
         return None
+
+
+def _resolve_export_relative_path(raw_path: str) -> Optional[Path]:
+    path_text = str(raw_path or "").strip()
+    if not path_text:
+        return None
+    path = Path(path_text)
+    if path.is_absolute():
+        return path
+    return Path(DEFAULT_EXPORT_ROOT) / path
+
+
+def _read_json_file(path: Optional[Path]) -> Dict[str, Any]:
+    if path is None or not path.is_file():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _read_jsonl_rows(path: Optional[Path], *, limit: int = 20) -> List[Dict[str, Any]]:
+    if path is None or not path.is_file():
+        return []
+    rows: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            if len(rows) >= limit:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+    return rows
 
 
 def _load_base_llm() -> Any:
@@ -245,6 +352,142 @@ def _make_repo_library() -> RepoLibrary:
 
 
 repo_lib = _make_repo_library()
+
+
+def _get_coarse_lane_retriever():
+    """
+    Lazily build the coarse lane-based retriever over:
+    - repo semantic summaries
+    - paper↔repo alignments
+    - coarse paper-span ↔ repo-chunk bridge rows
+    """
+    global _COARSE_LANE_RETRIEVER
+    if _COARSE_LANE_RETRIEVER is not None:
+        return _COARSE_LANE_RETRIEVER
+
+    from models.mirrormind import CoarseLaneRetriever
+
+    _COARSE_LANE_RETRIEVER = CoarseLaneRetriever(
+        repo_semantic_path="models/exports/semantic_from_chunks.jsonl",
+        paper_repo_align_path="exports/paper_repo_align.jsonl",
+        paper_repo_span_path="exports/paper_repo_span_align.jsonl",
+    )
+    return _COARSE_LANE_RETRIEVER
+
+
+def _execute_coarse_retrieval(
+    *,
+    question: str,
+    top_k_repos: int = 5,
+    top_k_papers: int = 5,
+    top_k_spans: int = 6,
+) -> Dict[str, Any]:
+    retriever = _get_coarse_lane_retriever()
+    return retriever.retrieve(
+        question,
+        top_k_repos=max(1, min(int(top_k_repos), 20)),
+        top_k_papers=max(1, min(int(top_k_papers), 20)),
+        top_k_spans=max(1, min(int(top_k_spans), 30)),
+    )
+
+
+def _shorten_for_answer(text: str, *, limit: int = 260) -> str:
+    text = " ".join(str(text or "").split())
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0].strip()
+    return (cut or text[:limit]).rstrip(".,;:") + "..."
+
+
+def _format_coarse_retrieval_answer(question: str, result: Dict[str, Any]) -> str:
+    fused_repos = result.get("fused_repos") or []
+    paper_hits = result.get("paper_hits") or []
+    support_spans = result.get("support_spans") or []
+
+    if not fused_repos:
+        return (
+            "I could not connect that query to any repo in the current "
+            "paper-repo alignment set."
+        )
+
+    best_repo = fused_repos[0]
+    repo_id = str(best_repo.get("repo_id") or "")
+    repo_score = float(best_repo.get("score") or 0.0)
+    summary_text = _shorten_for_answer(str(best_repo.get("summary_text") or ""), limit=320)
+    key_concepts = [str(x) for x in (best_repo.get("key_concepts") or []) if str(x)]
+
+    repo_papers = [hit for hit in paper_hits if str(hit.get("repo_id") or "") == repo_id]
+    top_paper = repo_papers[0] if repo_papers else (paper_hits[0] if paper_hits else None)
+
+    repo_spans = [hit for hit in support_spans if str(hit.get("repo_id") or "") == repo_id]
+    if not repo_spans:
+        repo_spans = support_spans[:]
+
+    lines: List[str] = []
+    header = f"Top coarse match: {repo_id}"
+    if top_paper:
+        header += (
+            f", aligned to paper "
+            f"{str(top_paper.get('paper_title') or '')} "
+            f"({str(top_paper.get('paper_id') or '')})"
+        )
+    header += f" [score {repo_score:.3f}]"
+    lines.append(header)
+
+    if summary_text:
+        lines.append("")
+        lines.append(summary_text)
+
+    if key_concepts:
+        lines.append("")
+        lines.append("Key concepts: " + ", ".join(key_concepts[:8]))
+
+    evidence_lines: List[str] = []
+    seen_paths: Set[str] = set()
+    for span in repo_spans:
+        repo_path = str(span.get("repo_path") or "")
+        if repo_path in seen_paths:
+            continue
+        seen_paths.add(repo_path)
+        paper_excerpt = _shorten_for_answer(str(span.get("paper_text") or ""), limit=220)
+        matched_terms = [str(x) for x in (span.get("matched_terms") or span.get("shared_terms") or []) if str(x)]
+        page_start = span.get("page_start")
+        page_end = span.get("page_end")
+        page_label = ""
+        if page_start is not None and page_end is not None:
+            if int(page_start) == int(page_end):
+                page_label = f"page {int(page_start)}"
+            else:
+                page_label = f"pages {int(page_start)}-{int(page_end)}"
+        ev = f"- {repo_path}"
+        if page_label:
+            ev += f" <-> {page_label}"
+        if matched_terms:
+            ev += f" | terms: {', '.join(matched_terms[:6])}"
+        if paper_excerpt:
+            ev += f"\n  paper span: {paper_excerpt}"
+        evidence_lines.append(ev)
+        if len(evidence_lines) >= 3:
+            break
+
+    if evidence_lines:
+        lines.append("")
+        lines.append("Grounding:")
+        lines.extend(evidence_lines)
+
+    alternates = [
+        hit for hit in fused_repos[1:4]
+        if float(hit.get("score") or 0.0) >= 0.45 * repo_score
+    ]
+    if alternates:
+        alt_text = ", ".join(
+            f"{str(hit.get('repo_id') or '')} ({float(hit.get('score') or 0.0):.3f})"
+            for hit in alternates
+        )
+        lines.append("")
+        lines.append("Other plausible repo matches: " + alt_text)
+
+    return "\n".join(line for line in lines if line is not None).strip()
 
 
 @app.on_event("startup")
@@ -895,6 +1138,7 @@ async def index() -> HTMLResponse:
           <select id="interaction-mode">
             <option value="repo_skill_chat">Chat (selected repo · per-skill)</option>
             <option value="comparative_qa">QA (library comparative)</option>
+            <option value="coarse_retrieval">Coarse Retrieval (paper + repo lanes)</option>
             <option value="meta_skill">Meta Skill (library)</option>
           </select>
           <label for="interaction-skill">Skill (for selected repo)</label>
@@ -1754,6 +1998,17 @@ async def index() -> HTMLResponse:
             qa_mode: qaMode || null
           })
         });
+      } else if (mode === 'coarse_retrieval') {
+        const response = await fetch('/api/coarse_retrieve', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            question: msg,
+            top_k_repos: 5,
+            top_k_papers: 5,
+            top_k_spans: 6
+          })
+        });
       } else if (mode === 'meta_skill') {
         const target = repos.slice(0, 3).map(r => r.repo_id);
         const taskFamily = (msg || '').trim() || 'style_imitation';
@@ -1775,7 +2030,15 @@ async def index() -> HTMLResponse:
       }
 
       const data = await response.json();
-      document.getElementById('interaction-output').textContent = JSON.stringify(data, null, 2);
+      const outEl = document.getElementById('interaction-output');
+      if (outEl) {
+        if (mode === 'coarse_retrieval' && data && typeof data.answer === 'string') {
+          const raw = (data.result != null) ? JSON.stringify(data.result, null, 2) : JSON.stringify(data, null, 2);
+          outEl.textContent = data.answer + '\n\n---\n\n' + raw;
+        } else {
+          outEl.textContent = JSON.stringify(data, null, 2);
+        }
+      }
     }
 
     async function loadSkills() {
@@ -2177,6 +2440,11 @@ async def api_list_repos() -> Dict[str, Any]:
                 "context_key": compute_repo_context_key(rid, entry),
                 "has_indices": bool(entry.get("indices")),
                 "has_skills": bool(entry.get("skills")),
+                "has_extensions": bool(entry.get("extensions")),
+                "has_repo_skills_miner": bool(
+                    isinstance(entry.get("extensions"), dict)
+                    and (entry.get("extensions") or {}).get("repo_skills_miner")
+                ),
             }
         )
     return {"repos": out}
@@ -2206,6 +2474,54 @@ async def api_get_repo(repo_id: str) -> Dict[str, Any]:
     entry["commit_count"] = commit_count
 
     return entry
+
+
+@app.get("/api/repos/{repo_id}/extensions/repo_skills_miner")
+async def api_get_repo_skills_miner_extension(
+    repo_id: str,
+    limit: int = 20,
+) -> Dict[str, Any]:
+    """
+    Return structured repo_skills_miner data for a single repository.
+    """
+    manifest = load_manifest()
+    repos_meta = manifest.get("repos") or {}
+    if not isinstance(repos_meta, dict):
+        repos_meta = {}
+    entry_any = repos_meta.get(repo_id)
+    if not isinstance(entry_any, dict):
+        raise HTTPException(status_code=404, detail=f"repo_id not found: {repo_id!r}")
+
+    entry = dict(entry_any)
+    extensions = entry.get("extensions") or {}
+    if not isinstance(extensions, dict):
+        extensions = {}
+    ext_meta_any = extensions.get("repo_skills_miner")
+    if not isinstance(ext_meta_any, dict):
+        raise HTTPException(
+            status_code=404,
+            detail=f"repo_skills_miner extension not found for repo_id={repo_id!r}",
+        )
+
+    ext_meta = dict(ext_meta_any)
+    paths = ext_meta.get("paths") or {}
+    if not isinstance(paths, dict):
+        paths = {}
+    summary_path = _resolve_export_relative_path(str(paths.get("summary") or ""))
+    skills_path = _resolve_export_relative_path(str(paths.get("skills") or ""))
+    annotations_path = _resolve_export_relative_path(str(paths.get("annotations") or ""))
+    signals_path = _resolve_export_relative_path(str(paths.get("signals") or ""))
+    limit = max(1, min(int(limit), 100))
+
+    return {
+        "repo_id": repo_id,
+        "extension": "repo_skills_miner",
+        "metadata": ext_meta,
+        "summary": _read_json_file(summary_path),
+        "skills": _read_jsonl_rows(skills_path, limit=limit),
+        "annotations": _read_jsonl_rows(annotations_path, limit=limit),
+        "signals": _read_jsonl_rows(signals_path, limit=limit),
+    }
 
 
 @app.post("/api/query")
@@ -2354,6 +2670,60 @@ async def api_qa_execute(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         "status": "completed",
         "plan": plan,
         "answer": answer_text,
+    }
+
+
+@app.post("/api/coarse_retrieve")
+async def api_coarse_retrieve(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """
+    Execute lane-based coarse retrieval across:
+    - repo semantic summaries
+    - aligned paper texts
+    - coarse paper-span ↔ repo-chunk bridge rows
+
+    Expected payload:
+        {
+          "question": "...",
+          "top_k_repos": 5?,
+          "top_k_papers": 5?,
+          "top_k_spans": 6?
+        }
+    """
+    question = str(payload.get("question") or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="`question` is required.")
+
+    def _as_optional_int(value: Any, default: int) -> int:
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except Exception:
+            raise HTTPException(status_code=400, detail="top-k values must be integers.")
+
+    top_k_repos = _as_optional_int(payload.get("top_k_repos"), 5)
+    top_k_papers = _as_optional_int(payload.get("top_k_papers"), 5)
+    top_k_spans = _as_optional_int(payload.get("top_k_spans"), 6)
+
+    try:
+        result = _execute_coarse_retrieval(
+            question=question,
+            top_k_repos=top_k_repos,
+            top_k_papers=top_k_papers,
+            top_k_spans=top_k_spans,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"coarse retrieval failed: {exc}")
+
+    answer = _format_coarse_retrieval_answer(question, result)
+
+    return {
+        "type": "coarse_retrieval_result",
+        "status": "completed",
+        "answer": answer,
+        "result": result,
     }
 
 
@@ -2528,12 +2898,7 @@ async def api_arxiv_search(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any
             # Mirror the storage convention used by the downloader:
             # - Prefer /arxiv/pdfs/YYMM/<id>.pdf when the id starts with YYMM.
             # - Fall back to /arxiv/pdfs/<id>.pdf for non-standard ids.
-            yymm = pdf_id[:4]
-            if len(yymm) == 4 and yymm.isdigit():
-                pdf_path = ARXIV_PDF_ROOT / yymm / f"{pdf_id}.pdf"
-            else:
-                pdf_path = ARXIV_PDF_ROOT / f"{pdf_id}.pdf"
-            has_pdf = pdf_path.is_file()
+            has_pdf = _find_local_arxiv_pdf(pdf_id) is not None
 
         enriched = dict(rec)
         enriched["has_pdf"] = has_pdf
@@ -2552,15 +2917,15 @@ async def api_arxiv_pdf(paper_id: str):
     """
     Return a locally downloaded Arxiv PDF for the given paper_id, if present.
 
-    The downloader script stores PDFs under `/arxiv/pdfs/{id}.pdf`, where
-    `id` is typically the trailing segment of the Arxiv identifier.
+    PDFs may live either directly under `/arxiv/pdfs/` or under
+    `/arxiv/pdfs/YYMM/`, depending on which downloader wrote them.
     """
     # Normalize to the trailing segment to match the downloader's convention.
     pdf_id = str(paper_id or "").strip().split("/")[-1]
     if not pdf_id:
         raise HTTPException(status_code=400, detail="invalid paper_id")
-    pdf_path = ARXIV_PDF_ROOT / f"{pdf_id}.pdf"
-    if not pdf_path.is_file():
+    pdf_path = _find_local_arxiv_pdf(pdf_id)
+    if pdf_path is None:
         raise HTTPException(
             status_code=404,
             detail=(
@@ -2643,8 +3008,7 @@ async def api_arxiv_download(payload: Dict[str, Any] = Body(...)) -> Dict[str, A
             errors.append({"id": pid, "error": "invalid arxiv id"})
             continue
 
-        pdf_path = ARXIV_PDF_ROOT / f"{norm_id}.pdf"
-        if pdf_path.is_file():
+        if _find_local_arxiv_pdf(norm_id) is not None:
             skipped_existing += 1
             continue
 
@@ -3152,6 +3516,3 @@ async def api_source(
             "lines": snippet_lines,
         },
     }
-
-
-

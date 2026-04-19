@@ -17,7 +17,7 @@ import argparse
 import json
 import os
 import warnings
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Sequence
 
 from scripts.library_repo_graph_export import (
     DEFAULT_EXPORT_ROOT,
@@ -29,6 +29,7 @@ from scripts.library_repo_graph_export import (
 
 def build_library(
     library_root: str = DEFAULT_LIBRARY_ROOT,
+    extra_library_roots: Optional[Sequence[str]] = None,
     export_root: str = DEFAULT_EXPORT_ROOT,
 ) -> List[Dict[str, Any]]:
     """
@@ -46,6 +47,7 @@ def build_library(
 
     summaries = export_library(
         library_root=library_root_abs,
+        extra_library_roots=extra_library_roots,
         export_root=export_root_abs,
     )
     return summaries
@@ -67,6 +69,15 @@ def main() -> None:
         help="Root directory that contains individual repositories (default: /data/repositories).",
     )
     parser.add_argument(
+        "--extra-library-root",
+        action="append",
+        dest="extra_library_roots",
+        help=(
+            "Additional root directory to scan and persist as part of the "
+            "library. May be passed multiple times."
+        ),
+    )
+    parser.add_argument(
         "--export-root",
         type=str,
         default=DEFAULT_EXPORT_ROOT,
@@ -81,6 +92,7 @@ def main() -> None:
 
     summaries = build_library(
         library_root=args.library_root,
+        extra_library_roots=args.extra_library_roots,
         export_root=args.export_root,
     )
 
@@ -94,6 +106,11 @@ def main() -> None:
         return
 
     print(f"Built library from root: {os.path.abspath(args.library_root)}")
+    if args.extra_library_roots:
+        print(
+            "Extended with roots: "
+            + ", ".join(os.path.abspath(root) for root in args.extra_library_roots)
+        )
     print(f"Exports written under: {os.path.abspath(args.export_root)}")
     print(f"Export schema version: {EXPORT_SCHEMA_VERSION}")
     print()
@@ -113,5 +130,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 

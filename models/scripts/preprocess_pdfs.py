@@ -28,16 +28,41 @@ import time
 from models.tier3_pdf.pdf_tokenization import PDFTokenizationModel
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PDF_SEARCH_ROOTS = [REPO_ROOT / "exports/arxiv_pdfs", Path("/arxiv/pdfs")]
+
+
+def _infer_pdf_year(pdf_path: Path) -> int | None:
+    """
+    Best-effort calendar year from an arXiv-style PDF filename.
+
+    Recent arXiv IDs use YYMM.xxxxx, so we map the leading YY to 19YY/20YY.
+    This supports both root-level files like `/arxiv/pdfs/1001.12345.pdf`
+    and year-bucketed files like `/arxiv/pdfs/1001/1001.12345.pdf`.
+    """
+    stem = pdf_path.stem
+    if len(stem) >= 4 and stem[:4].isdigit():
+        yy = int(stem[:2])
+        return 1900 + yy if yy >= 90 else 2000 + yy
+    return None
+
+
 def iter_pdf_paths(year_start: int | None, year_end: int | None, limit: int | None) -> List[Path]:
     paths: List[Path] = []
-    base = Path("/arxiv/pdfs")
-    years = []
-    if year_start and year_end:
-        years = list(range(year_start, year_end + 1))
-    else:
-        years = sorted([int(p.name) for p in base.iterdir() if p.is_dir() and p.name.isdigit()])
-    for y in years:
-        for p in (base / str(y)).glob("*.pdf"):
+
+    want_year_filter = year_start is not None and year_end is not None
+    seen: set[Path] = set()
+    for base in PDF_SEARCH_ROOTS:
+        if not base.is_dir():
+            continue
+        for p in sorted(base.rglob("*.pdf")):
+            if not p.is_file() or p in seen:
+                continue
+            if want_year_filter:
+                year = _infer_pdf_year(p)
+                if year is None or year < year_start or year > year_end:
+                    continue
+            seen.add(p)
             paths.append(p)
             if limit and len(paths) >= limit:
                 return paths

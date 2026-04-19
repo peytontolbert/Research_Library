@@ -27,6 +27,47 @@ from models.shared.graph_data import (
 from models.shared.pdf_utils import extract_pdf_text
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PDF_SEARCH_ROOTS = [REPO_ROOT / "exports/arxiv_pdfs", Path("/arxiv/pdfs")]
+
+
+def _candidate_data_paths(path_like: Path | str) -> List[Path]:
+    raw = Path(path_like)
+    candidates = [raw]
+    if not raw.is_absolute():
+        candidates.append(REPO_ROOT / raw)
+        if not str(raw).startswith("models/"):
+            candidates.append(REPO_ROOT / "models" / raw)
+    seen: set[Path] = set()
+    out: List[Path] = []
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        out.append(candidate)
+    return out
+
+
+def _resolve_data_dir(path_like: Path | str, pattern: str) -> Path:
+    for candidate in _candidate_data_paths(path_like):
+        if candidate.is_dir() and any(candidate.glob(pattern)):
+            return candidate
+    for candidate in _candidate_data_paths(path_like):
+        if candidate.exists():
+            return candidate
+    return _candidate_data_paths(path_like)[0]
+
+
+def _resolve_data_file(path_like: Path | str) -> Path:
+    for candidate in _candidate_data_paths(path_like):
+        if candidate.is_file():
+            return candidate
+    for candidate in _candidate_data_paths(path_like):
+        if candidate.exists():
+            return candidate
+    return _candidate_data_paths(path_like)[0]
+
+
 def load_manifest(path: str = "/data/arxiv/arxiv-metadata-oai-snapshot.json") -> Dict[str, Any]:
     """Load the arXiv manifest if present; fall back to the snapshot."""
     manifest_path = Path(path)
@@ -103,19 +144,45 @@ def _sample_metadata(manifest: Dict[str, Any], max_samples: int, filters: Dict[s
 
 
 def _iter_pdf_paths(filters: Dict[str, Any]) -> Iterable[str]:
+    if not any(base.exists() for base in PDF_SEARCH_ROOTS):
+        return []
+
+    def _infer_year(path: Path) -> int | None:
+        stem = path.stem
+        if len(stem) >= 4 and stem[:4].isdigit():
+            yy = int(stem[:2])
+            return 1900 + yy if yy >= 90 else 2000 + yy
+        return None
+
     years = filters.get("years")
     if years and len(years) == 2:
         y0, y1 = int(years[0]), int(years[1])
-        for year in range(y0, y1 + 1):
-            for p in glob.glob(f"/arxiv/pdfs/{year}/*.pdf"):
-                yield p
+        seen: set[Path] = set()
+        for base in PDF_SEARCH_ROOTS:
+            if not base.exists():
+                continue
+            for p in sorted(base.rglob("*.pdf")):
+                if not p.is_file() or p in seen:
+                    continue
+                year = _infer_year(p)
+                if year is None or year < y0 or year > y1:
+                    continue
+                seen.add(p)
+                yield str(p)
     else:
-        for p in glob.glob("/arxiv/pdfs/*/*.pdf"):
-            yield p
+        seen: set[Path] = set()
+        for base in PDF_SEARCH_ROOTS:
+            if not base.exists():
+                continue
+            for p in sorted(base.rglob("*.pdf")):
+                if p.is_file() and p not in seen:
+                    seen.add(p)
+                    yield str(p)
 
 
 def _iter_structured_pdfs(shard_dir: Path, max_samples: int) -> Iterable[Dict[str, Any]]:
     """Yield records from structured PDF shards if present."""
+    shard_dir = _resolve_data_dir(shard_dir, "pdf_structured_*.jsonl")
     if not shard_dir.exists():
         return []
     count = 0
@@ -166,7 +233,7 @@ def _sample_pdfs(max_samples: int, filters: Dict[str, Any], chunk_chars: int = 8
 
 def _load_structured_pdfs(max_samples: int) -> List[Dict[str, Any]]:
     """Load structured PDF tokens from exports/pdfs_structured shards."""
-    base = Path("exports/pdfs_structured")
+    base = _resolve_data_dir("exports/pdfs_structured", "pdf_structured_*.jsonl")
     if not base.exists():
         return []
     shards = sorted(base.glob("pdf_structured_*.jsonl"))
@@ -190,6 +257,7 @@ def _load_structured_pdfs(max_samples: int) -> List[Dict[str, Any]]:
 
 def _load_paper_repo_alignment(max_samples: int, path: Path = Path("exports/paper_repo_align.jsonl")) -> List[Dict[str, Any]]:
     """Load precomputed paper↔repo alignment pairs."""
+    path = _resolve_data_file(path)
     if not path.exists():
         return []
     samples: List[Dict[str, Any]] = []
@@ -228,6 +296,7 @@ def _load_corpus_split(
 
     Returns a list of simple dict records shaped to match the rest of build_dataset.
     """
+    base_dir = _resolve_data_dir(base_dir, "*.jsonl")
     split_dir = base_dir / split
     if not split_dir.exists():
         return []
@@ -506,16 +575,11 @@ def build_dataset(config: Dict[str, Any]):
     chunk_overlap_pdf = construction.get("chunk_overlap_pdf", 400)
     chunk_chars_code = construction.get("chunk_chars_code", 4000)
     chunk_overlap_code = construction.get("chunk_overlap_code", 200)
-    structured_pdf_dir_candidate = Path(construction.get("structured_pdf_dir") or "exports/pdfs_structured")
-    root_pdf_dir = Path("/data/repository_library/exports/pdfs_structured")
-    def _has_structured(path: Path) -> bool:
-        return path.exists() and any(path.glob("pdf_structured_*.jsonl"))
-    if _has_structured(structured_pdf_dir_candidate):
-        structured_pdf_dir = structured_pdf_dir_candidate
-    elif _has_structured(root_pdf_dir):
-        structured_pdf_dir = root_pdf_dir
-    else:
-        structured_pdf_dir = structured_pdf_dir_candidate
+    structured_pdf_dir = _resolve_data_dir(
+        construction.get("structured_pdf_dir") or "exports/pdfs_structured",
+        "pdf_structured_*.jsonl",
+    )
+    alignment_path = _resolve_data_file(construction.get("alignment_path") or "exports/paper_repo_align.jsonl")
     sources = config.get("dataset", {}).get("sources", [])
     archetype = get_archetype(config.get("model_id", "UNK")) or {}
     archetype_name = archetype.get("archetype", "generative")
@@ -550,7 +614,7 @@ def build_dataset(config: Dict[str, Any]):
                 samples.extend(_build_generative(manifest_entries, max_samples))
         # Alignment-aware path for paper↔repo fusion models.
         if model_id in {"C1", "C2", "C6"}:
-            align_pairs = _load_paper_repo_alignment(max_samples)
+            align_pairs = _load_paper_repo_alignment(max_samples, alignment_path)
             if align_pairs:
                 for pair in align_pairs:
                     paper = pair.get("paper_text") or pair.get("paper") or pair.get("text_a") or ""

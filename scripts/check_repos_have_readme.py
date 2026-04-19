@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import Iterable, List, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from scripts.library_repo_scanner import DEFAULT_LIBRARY_ROOT, RepoInfo, iter_repositories
 
@@ -31,10 +31,14 @@ def has_readme(repo: RepoInfo) -> bool:
     return False
 
 
-def find_repos_missing_readme(root: str) -> List[RepoInfo]:
-    """Scan `root` for repositories that do not have a README."""
+def find_repos_missing_readme(
+    root: str,
+    *,
+    extra_roots: Optional[Sequence[str]] = None,
+) -> List[RepoInfo]:
+    """Scan one or more library roots for repositories that do not have a README."""
     missing: List[RepoInfo] = []
-    for repo in iter_repositories(root=root):
+    for repo in iter_repositories(root=root, roots=extra_roots):
         if not has_readme(repo):
             missing.append(repo)
     return missing
@@ -51,6 +55,15 @@ def main() -> None:
         help="Root directory that contains individual repositories "
         f"(default: {DEFAULT_LIBRARY_ROOT}).",
     )
+    parser.add_argument(
+        "--extra-root",
+        action="append",
+        dest="extra_roots",
+        help=(
+            "Additional root directory to scan for repositories. "
+            "May be passed multiple times."
+        ),
+    )
     args = parser.parse_args()
 
     root = os.path.abspath(args.root)
@@ -58,7 +71,7 @@ def main() -> None:
         print(f"ERROR: Root directory does not exist or is not a directory: {root}", file=sys.stderr)
         sys.exit(2)
 
-    missing = find_repos_missing_readme(root=root)
+    missing = find_repos_missing_readme(root=root, extra_roots=args.extra_roots)
 
     if not missing:
         print(f"All repositories under {root} have a README.")
@@ -74,5 +87,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 

@@ -298,6 +298,15 @@ class Trainer:
             return None
 
         corpus_root = Path(ds_cfg.get("corpus_dir") or "exports/corpus")
+        if not corpus_root.is_absolute():
+            repo_root = Path(__file__).resolve().parents[2]
+            candidates = [corpus_root, repo_root / corpus_root]
+            if not str(corpus_root).startswith("models/"):
+                candidates.append(repo_root / "models" / corpus_root)
+            for candidate in candidates:
+                if candidate.exists():
+                    corpus_root = candidate
+                    break
         data_files: Dict[str, Any] = {}
 
         def _glob(subdir: str, pattern: str) -> Any:

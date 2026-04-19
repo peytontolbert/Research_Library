@@ -5,7 +5,7 @@ import os
 import subprocess
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from modules.program_graph import Artifact, Edge, Entity  # type: ignore
 
@@ -72,6 +72,53 @@ def _save_manifest(export_root: str, manifest: Dict[str, Any]) -> str:
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(json.dumps(manifest, indent=2))
     return path
+
+
+def _normalize_root_list(roots: Iterable[str]) -> List[str]:
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for root in roots:
+        raw = str(root or "").strip()
+        if not raw:
+            continue
+        abs_root = os.path.abspath(raw)
+        if abs_root in seen:
+            continue
+        seen.add(abs_root)
+        normalized.append(abs_root)
+    return normalized
+
+
+def _stored_extension_roots(manifest: Dict[str, Any]) -> List[str]:
+    roots_meta = manifest.get("library_roots") or {}
+    if not isinstance(roots_meta, dict):
+        return []
+    extensions = roots_meta.get("extensions") or []
+    if not isinstance(extensions, list):
+        return []
+    return _normalize_root_list(str(root) for root in extensions)
+
+
+def resolve_library_roots(
+    *,
+    library_root: str = DEFAULT_LIBRARY_ROOT,
+    extra_library_roots: Optional[Sequence[str]] = None,
+    manifest: Optional[Dict[str, Any]] = None,
+) -> Dict[str, List[str] | str]:
+    """Resolve the primary library root plus any persisted extensions."""
+    primary_root = os.path.abspath(library_root)
+    stored_extensions = _stored_extension_roots(manifest or {})
+    requested_extensions = _normalize_root_list(extra_library_roots or [])
+    extension_roots = _normalize_root_list(
+        [*stored_extensions, *requested_extensions]
+    )
+    all_roots = _normalize_root_list([primary_root, *extension_roots])
+    extension_roots = [root for root in all_roots if root != primary_root]
+    return {
+        "default": primary_root,
+        "extensions": extension_roots,
+        "all": all_roots,
+    }
 
 
 def _compute_repo_state(repo: RepoInfo) -> Dict[str, Any]:
@@ -188,6 +235,7 @@ def _export_repo_graph(repo: RepoInfo, out_dir: str) -> Dict[str, Any]:
     return {
         "repo_id": repo.repo_id,
         "root": repo.root,
+        "library_root": repo.library_root,
         "entities": len(entities),
         "edges": len(edges),
         "artifacts": len(artifacts),
@@ -200,6 +248,7 @@ def _export_repo_graph(repo: RepoInfo, out_dir: str) -> Dict[str, Any]:
 
 def export_library(
     library_root: str = DEFAULT_LIBRARY_ROOT,
+    extra_library_roots: Optional[Sequence[str]] = None,
     export_root: str = DEFAULT_EXPORT_ROOT,
 ) -> List[Dict[str, Any]]:
     """
@@ -223,8 +272,21 @@ def export_library(
     repos_meta: Dict[str, Any] = manifest["repos"]
     manifest["manifest_version"] = int(manifest.get("manifest_version") or 1)
     manifest["export_schema_version"] = EXPORT_SCHEMA_VERSION
+    roots_meta = resolve_library_roots(
+        library_root=library_root,
+        extra_library_roots=extra_library_roots,
+        manifest=manifest,
+    )
+    manifest["library_roots"] = {
+        "default": roots_meta["default"],
+        "extensions": roots_meta["extensions"],
+    }
 
-    repos = discover_repositories(root=library_root)
+    all_roots = roots_meta["all"]
+    repos = discover_repositories(
+        root=str(all_roots[0]),
+        roots=[str(root) for root in all_roots[1:]],
+    )
     results: List[Dict[str, Any]] = []
 
     for repo in repos:
@@ -235,13 +297,24 @@ def export_library(
 
         # Decide whether to skip or rebuild this repo's export
         if (prev_schema == EXPORT_SCHEMA_VERSION) and (prev_state == repo_state):
+            repos_meta[repo.repo_id] = {
+                **prev_entry,
+                "repo_root": repo.root,
+                "library_root": repo.library_root,
+                "export_schema_version": EXPORT_SCHEMA_VERSION,
+                "repo_state": repo_state,
+                "indices": prev_entry.get("indices") or {},
+                "skills": prev_entry.get("skills") or {},
+            }
             summary: Dict[str, Any] = {
                 "repo_id": repo.repo_id,
                 "root": repo.root,
+                "library_root": repo.library_root,
                 "skipped": True,
                 "reason": "up_to_date",
                 "export_schema_version": EXPORT_SCHEMA_VERSION,
                 "repo_state": repo_state,
+                "last_indexed_at": prev_entry.get("last_indexed_at"),
             }
             results.append(summary)
             continue
@@ -257,10 +330,12 @@ def export_library(
         # Preserve any existing index/skill metadata for this repo
         prev_indices = prev_entry.get("indices") or {}
         prev_skills = prev_entry.get("skills") or {}
+        prev_extensions = prev_entry.get("extensions") or {}
 
         # Update manifest entry for this repo
         repos_meta[repo.repo_id] = {
             "repo_root": repo.root,
+            "library_root": repo.library_root,
             "export_schema_version": EXPORT_SCHEMA_VERSION,
             "repo_state": repo_state,
             "last_indexed_at": summary["last_indexed_at"],
@@ -268,6 +343,7 @@ def export_library(
             # Optional, populated by downstream indexing / adapter tooling
             "indices": prev_indices,
             "skills": prev_skills,
+            "extensions": prev_extensions,
         }
 
     _save_manifest(export_root, manifest)
@@ -288,6 +364,15 @@ def main() -> None:
         help="Root directory that contains individual repositories (default: /data/repositories).",
     )
     parser.add_argument(
+        "--extra-library-root",
+        action="append",
+        dest="extra_library_roots",
+        help=(
+            "Additional root directory to scan and persist as part of the "
+            "library. May be passed multiple times."
+        ),
+    )
+    parser.add_argument(
         "--export-root",
         type=str,
         default=DEFAULT_EXPORT_ROOT,
@@ -297,6 +382,7 @@ def main() -> None:
 
     summaries = export_library(
         library_root=os.path.abspath(args.library_root),
+        extra_library_roots=args.extra_library_roots,
         export_root=os.path.abspath(args.export_root),
     )
     json.dump(summaries, sys.stdout, indent=2)
@@ -306,5 +392,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

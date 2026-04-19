@@ -1,60 +1,67 @@
 models:
-  name: llama
-      model_id: meta-llama/Llama-3.1-8B-Instruct
-      model_type: causal-lm
-      cache_dir: /data/checkpoints
-      model_description: The base LLM model for the repository library.
-      model_version: 1.0.0
-      model_created_at: 2025-11-22
-      model_updated_at: 2025-11-22
-      model_created_by: repository-library
-      model_updated_by: repository-library
-      model_status: active
-      model_tags:
-        - llm
-        - base
-  name: T5
-      model_id: google/t5-v1_1-base
-      model_type: seq2seq-lm
-      cache_dir: /data/checkpoints
-      model_description: T5 base model for text-to-text tasks, included as an auxiliary model.
-      model_version: 1.0.0
-      model_created_at: 2025-11-22
-      model_updated_at: 2025-11-22
-      model_created_by: repository-library
-      model_updated_by: repository-library
-      model_status: active
-      model_tags:
-        - llm
-        - t5
-        - auxiliary
-  name: bert
-      model_id: google/bert-base-uncased
-      model_type: encoder
-      cache_dir: /data/checkpoints
-      model_description: BERT base model for embeddings and token-level tasks, included as an auxiliary encoder.
-      model_version: 1.0.0
-      model_created_at: 2025-11-22
-      model_updated_at: 2025-11-22
-      model_created_by: repository-library
-      model_updated_by: repository-library
-      model_status: active
-      model_tags:
-        - bert
-        - encoder
-        - auxiliary
-  name: all-MiniLM-L6-v2
-      model_id: sentence-transformers/all-MiniLM-L6-v2
-      model_type: encoder
-      cache_dir: /data/checkpoints
-      model_description: Sentence-transformers base model for embeddings and token-level tasks, included as an auxiliary encoder.
-      model_version: 1.0.0
-      model_created_at: 2025-11-22
-      model_updated_at: 2025-11-22
-      model_created_by: repository-library
-      model_updated_by: repository-library
-      model_status: active
-      model_tags:
-        - sentence-transformers
-        - encoder
-        - auxiliary
+  llama:
+    name: llama
+    model_id: meta-llama/Llama-3.1-8B-Instruct
+    model_type: causal-lm
+    cache_dir: /data/checkpoints
+    model_description: The base LLM model for the repository library.
+    model_version: 1.0.0
+    model_created_at: 2025-11-22
+    model_updated_at: 2025-11-22
+    model_created_by: repository-library
+    model_updated_by: repository-library
+    model_status: active
+    model_tags:
+      - llm
+      - base
+
+  T5:
+    name: T5
+    model_id: google/t5-v1_1-base
+    model_type: seq2seq-lm
+    cache_dir: /data/checkpoints
+    model_description: T5 base model for text-to-text tasks, included as an auxiliary model.
+    model_version: 1.0.0
+    model_created_at: 2025-11-22
+    model_updated_at: 2025-11-22
+    model_created_by: repository-library
+    model_updated_by: repository-library
+    model_status: active
+    model_tags:
+      - llm
+      - t5
+      - auxiliary
+
+  bert:
+    name: bert
+    model_id: google/bert-base-uncased
+    model_type: encoder
+    cache_dir: /data/checkpoints
+    model_description: BERT base model for embeddings and token-level tasks, included as an auxiliary encoder.
+    model_version: 1.0.0
+    model_created_at: 2025-11-22
+    model_updated_at: 2025-11-22
+    model_created_by: repository-library
+    model_updated_by: repository-library
+    model_status: active
+    model_tags:
+      - bert
+      - encoder
+      - auxiliary
+
+  all-MiniLM-L6-v2:
+    name: all-MiniLM-L6-v2
+    model_id: sentence-transformers/all-MiniLM-L6-v2
+    model_type: encoder
+    cache_dir: /data/checkpoints
+    model_description: Sentence-transformers base model for embeddings and token-level tasks, included as an auxiliary encoder.
+    model_version: 1.0.0
+    model_created_at: 2025-11-22
+    model_updated_at: 2025-11-22
+    model_created_by: repository-library
+    model_updated_by: repository-library
+    model_status: active
+    model_tags:
+      - sentence-transformers
+      - encoder
+      - auxiliary

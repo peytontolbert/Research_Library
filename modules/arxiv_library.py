@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional
 
+from modules.arxiv_categories import category_matches_any_prefix
+
 
 ARXIV_ROOT = Path("/data/arxiv")
 ARXIV_METADATA_PATH = ARXIV_ROOT / "arxiv-metadata-oai-snapshot.json"
@@ -117,9 +119,10 @@ def search_keyword(
 
     out: List[Dict[str, object]] = []
     cpref = str(category_prefix or "").strip()
+    prefixes = [cpref] if cpref else []
 
     for rec in iter_metadata():
-        if cpref and not rec.categories.startswith(cpref):
+        if prefixes and not category_matches_any_prefix(rec.categories, prefixes):
             continue
 
         haystack_parts: List[str] = []

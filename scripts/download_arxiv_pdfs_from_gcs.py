@@ -35,6 +35,7 @@ from modules.arxiv_library import iter_metadata  # type: ignore
 
 ARXIV_ROOT = Path("/data/arxiv")
 DEFAULT_OUT_DIR = Path("/arxiv/pdfs")
+DEFAULT_OUT_CACHE_DIR = REPO_ROOT / "exports" / "arxiv_pdfs"
 DEFAULT_GCS_PREFIX = "gs://arxiv-dataset/arxiv/arxiv/pdf"
 
 
@@ -133,7 +134,8 @@ def _build_gcs_and_local_paths(
 
     Layout assumptions:
     - Remote: {gcs_prefix}/{yymm}/{base_id}.pdf
-    - Local:  {out_dir}/{base_id}.pdf
+    - Local may be either `{out_dir}/{base_id}.pdf` or
+      `{out_dir}/{yymm}/{base_id}.pdf`.
     """
     urls: List[str] = []
     prefix = gcs_prefix.rstrip("/")
@@ -141,8 +143,15 @@ def _build_gcs_and_local_paths(
 
     for base_id in ids:
         yymm = base_id[:4]
-        local_path = out_dir / f"{base_id}.pdf"
-        if local_path.exists():
+        local_candidates = []
+        for root in [out_dir, DEFAULT_OUT_DIR, DEFAULT_OUT_CACHE_DIR]:
+            local_candidates.extend(
+                [
+                    root / f"{base_id}.pdf",
+                    root / yymm / f"{base_id}.pdf",
+                ]
+            )
+        if any(path.exists() for path in local_candidates):
             continue
         urls.append(f"{prefix}/{yymm}/{base_id}.pdf")
 
@@ -223,6 +232,15 @@ def main(
     if dry_run:
         print("Dry run enabled; not invoking gsutil.")
         return
+
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        probe = out_dir / ".codex_write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except Exception:
+        print(f"[status] output dir {out_dir} is not writable; falling back to {DEFAULT_OUT_CACHE_DIR}")
+        out_dir = DEFAULT_OUT_CACHE_DIR
 
     rc = _run_gsutil_cp(urls, dest_dir=out_dir)
     if rc != 0:
@@ -308,5 +326,3 @@ if __name__ == "__main__":
         dry_run=bool(args.dry_run),
         paths_file=paths_file,
     )
-
-

@@ -11,6 +11,7 @@ from .domain import DomainGraph, DomainAgent
 from .coordinator import Coordinator, ReviewAgent
 from .context import ContextAssembler
 from .llm import build_llm, safe_build_llm, default_llama1b_config
+from .retrieval import CoarseLaneRetriever
 
 __all__ = [
     "Episode",
@@ -26,6 +27,7 @@ __all__ = [
     "Coordinator",
     "ReviewAgent",
     "ContextAssembler",
+    "CoarseLaneRetriever",
     "build_llm",
     "safe_build_llm",
     "default_llama1b_config",

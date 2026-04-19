@@ -58,6 +58,46 @@ from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Set
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _candidate_paths(path_str: str) -> List[Path]:
+    raw = Path(path_str)
+    candidates = [raw]
+    if not raw.is_absolute():
+        candidates.append(REPO_ROOT / raw)
+        if not str(raw).startswith("models/"):
+            candidates.append(REPO_ROOT / "models" / raw)
+    seen: Set[Path] = set()
+    out: List[Path] = []
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        out.append(candidate)
+    return out
+
+
+def _resolve_input_dir(path_str: str, pattern: str) -> Path:
+    for candidate in _candidate_paths(path_str):
+        if candidate.is_dir() and any(candidate.glob(pattern)):
+            return candidate
+    for candidate in _candidate_paths(path_str):
+        if candidate.exists():
+            return candidate
+    return _candidate_paths(path_str)[0]
+
+
+def _resolve_input_file(path_str: str) -> Path:
+    for candidate in _candidate_paths(path_str):
+        if candidate.is_file():
+            return candidate
+    for candidate in _candidate_paths(path_str):
+        if candidate.exists():
+            return candidate
+    return _candidate_paths(path_str)[0]
+
+
 def _hash_text(text: str) -> str:
     """Stable hash for deduplication."""
     h = hashlib.sha1()
@@ -342,6 +382,13 @@ def iter_alignment_examples(alignment_path: Path) -> Iterator[Dict]:
                 "label": label,
                 "score": score,
                 "domains": domains,
+                "paper_id": obj.get("paper_id"),
+                "repo_id": obj.get("repo_id"),
+                "pdf_path": obj.get("pdf_path"),
+                "repo_path": obj.get("repo_path"),
+                "repo_offset": obj.get("repo_offset"),
+                "negative_type": obj.get("negative_type"),
+                "shared_terms": obj.get("shared_terms") or [],
             }
             yield {
                 "id": f"pair:{_hash_text(paper_text[:128] + '||' + repo_text[:128])}",
@@ -486,9 +533,9 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    repos_chunks_dir = Path(args.repos_chunks_dir)
-    pdfs_structured_dir = Path(args.pdfs_structured_dir)
-    alignment_path = Path(args.alignment_path) if args.alignment_path else None
+    repos_chunks_dir = _resolve_input_dir(args.repos_chunks_dir, "repo_chunks_*.jsonl")
+    pdfs_structured_dir = _resolve_input_dir(args.pdfs_structured_dir, "pdf_structured_*.jsonl")
+    alignment_path = _resolve_input_file(args.alignment_path) if args.alignment_path else None
     out_dir = Path(args.out_dir)
     license_allow = set(l.lower() for l in (args.license_allow or [])) or None
     license_deny = set(l.lower() for l in (args.license_deny or [])) or None
@@ -509,5 +556,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 

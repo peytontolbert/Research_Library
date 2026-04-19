@@ -1,7 +1,7 @@
 Repository Library
 ==================
 
-A backend service and knowledge system that indexes code repositories stored in `/data/repositories`, builds a graph-centric representation of them under `/data/repository_library/exports`, and (in later phases) exposes LLM-powered retrieval and editing over this **repository library**.
+A backend service and knowledge system that indexes code repositories stored in `/data/repositories` plus any configured extension roots, builds a graph-centric representation of them under `/data/repository_library/exports`, and (in later phases) exposes LLM-powered retrieval and editing over this **repository library**.
 
 The current implementation focuses on:
 
@@ -11,7 +11,7 @@ The current implementation focuses on:
 
 ### Goals
 
-- **Central library of repositories**: Treat `/data/repositories` as a single searchable "library" of code and related assets.
+- **Central library of repositories**: Treat `/data/repositories` plus configured extension roots as a single searchable "library" of code and related assets.
 - **Graph-based knowledge model**: Represent repositories, files, symbols, and relationships (dependencies, ownership, references) as a program graph.
 - **Repository-centric skills**: For each repository, attach a set of *skills* (adapters, tools, indices) that specialize the system for Q&A, editing, navigation, testing, etc.
 - **LLM-powered workflows** (later phase): Answer questions, propose edits, and distill meta-knowledge over the entire library.
@@ -23,7 +23,7 @@ Conceptually, each repository is normalized into a `Repository` object:
 ```python
 class Repository:
     repo_id: str          # e.g. "linux" or "github:python/cpython"
-    root_path: Path       # on-disk mirror under /data/repositories
+    root_path: Path       # on-disk mirror under a configured library root
     metadata: dict        # tags, languages, git state, etc.
     graph: ProgramGraph   # code structure, symbols, dependencies
     index: RepoIndex      # text/code embeddings, search indices
@@ -33,7 +33,7 @@ class Repository:
 
 The **export pipeline** in `build.py` and `scripts/library_repo_graph_export.py` is responsible for:
 
-- Discovering repositories under `/data/repositories`.
+- Discovering repositories under `/data/repositories` and any persisted extension roots.
 - Building a `PythonRepoGraph` per repo.
 - Writing JSONL exports:
   - `{repo_id}.entities.jsonl`
@@ -66,7 +66,7 @@ In the current codebase:
 ### High-Level Architecture (Draft)
 
 - **Ingestion & Export**
-  - Scans `/data/repositories` on a schedule or trigger.
+  - Scans the default repository root and any persisted extension roots on a schedule or trigger.
   - For each repo, builds a `PythonRepoGraph` (see `scripts/python_repo_graph.py`).
   - Writes entities/edges/artifacts as JSONL under `/data/repository_library/exports/{repo_id}`.
   - Maintains a library-level manifest in `exports/_manifest.json`.
