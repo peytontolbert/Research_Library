@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pyarrow as pa  # type: ignore
+import pyarrow.parquet as pq  # type: ignore
+
 from scripts.export_paper_text_hf_dataset import export_paper_text_hf_dataset
 
 
@@ -333,4 +336,132 @@ def test_export_paper_text_hf_dataset_prefers_raw_pdf_text_for_full_export(tmp_p
     assert row["text"] == "Full page one.\n\nFull page two."
     assert row["page_count"] == 2
     assert row["token_types"] == ["raw_text_pdf"]
+    assert row["text_is_partial"] is False
+
+
+def test_export_paper_text_hf_dataset_uses_preextracted_raw_text(tmp_path: Path) -> None:
+    structured_dir = tmp_path / "pdfs_structured"
+    structured_dir.mkdir(parents=True, exist_ok=True)
+    raw_text_dir = structured_dir / "raw_text" / "2401"
+    raw_text_dir.mkdir(parents=True, exist_ok=True)
+    raw_text_path = raw_text_dir / "2401.00006v1.txt"
+    raw_text_path.write_text("Full cached paper text.\n\nSecond paragraph.", encoding="utf-8")
+
+    (structured_dir / "pdf_structured_00000.jsonl").write_text(
+        json.dumps(
+            {
+                "paper_id": "2401.00006v1",
+                "pdf_path": "/arxiv/pdfs/2401/2401.00006v1.pdf",
+                "tokens": [],
+                "raw_text_path": str(raw_text_path),
+                "raw_text_line_count": 2,
+                "raw_text_page_count": 7,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    metadata_path = tmp_path / "arxiv-metadata-oai-snapshot.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "id": "2401.00006",
+                "title": "Paper Six",
+                "versions": [{"version": "v1"}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    output_dir = tmp_path / "hf_out"
+    result = export_paper_text_hf_dataset(
+        structured_dir=str(structured_dir),
+        metadata_path=str(metadata_path),
+        output_dir=str(output_dir),
+        write_dataset_dict=True,
+        prefer_raw_pdf_text=True,
+        raw_pdf_max_chars=0,
+    )
+
+    assert result["stats"]["text_source_counts"]["raw_pdf_preextracted"] == 1
+    from datasets import load_from_disk  # type: ignore
+
+    ds = load_from_disk(str(output_dir / "dataset_dict"))
+    row = ds["train"][0]
+    assert row["text_source"] == "raw_pdf_preextracted"
+    assert row["text"] == "Full cached paper text.\n\nSecond paragraph."
+    assert row["page_count"] == 7
+    assert row["token_types"] == ["raw_text_preextracted"]
+    assert row["text_is_partial"] is False
+
+
+def test_export_paper_text_hf_dataset_reads_backfill_parquet_rows(tmp_path: Path) -> None:
+    structured_dir = tmp_path / "pdfs_structured"
+    structured_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "paper_id": "2401.00007v1",
+                    "canonical_paper_id": "2401.00007",
+                    "paper_version": "v1",
+                    "pdf_path": "/arxiv/pdfs/2401/2401.00007v1.pdf",
+                    "title": "",
+                    "abstract": "",
+                    "authors": "",
+                    "categories": "",
+                    "license": "",
+                    "update_date": "",
+                    "version_count": 0,
+                    "metadata_found": False,
+                    "text": "Backfilled full text.",
+                    "text_source": "raw_pdf_preextracted",
+                    "text_is_partial": False,
+                    "text_char_count": 21,
+                    "text_line_count": 1,
+                    "token_count": 1,
+                    "page_count": 9,
+                    "token_types": ["raw_text_preextracted"],
+                    "token_type_counts_json": "{\"raw_text_preextracted\":1}",
+                }
+            ]
+        ),
+        str(structured_dir / "paper_text_backfill_00000.parquet"),
+        compression="zstd",
+    )
+
+    metadata_path = tmp_path / "arxiv-metadata-oai-snapshot.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "id": "2401.00007",
+                "title": "Paper Seven",
+                "versions": [{"version": "v1"}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    output_dir = tmp_path / "hf_out"
+    result = export_paper_text_hf_dataset(
+        structured_dir=str(structured_dir),
+        metadata_path=str(metadata_path),
+        output_dir=str(output_dir),
+        write_dataset_dict=True,
+    )
+
+    assert result["stats"]["rows_written"] == 1
+    assert result["stats"]["text_source_counts"]["raw_pdf_preextracted"] == 1
+
+    from datasets import load_from_disk  # type: ignore
+
+    ds = load_from_disk(str(output_dir / "dataset_dict"))
+    row = ds["train"][0]
+    assert row["paper_id"] == "2401.00007v1"
+    assert row["title"] == "Paper Seven"
+    assert row["text"] == "Backfilled full text."
+    assert row["page_count"] == 9
     assert row["text_is_partial"] is False

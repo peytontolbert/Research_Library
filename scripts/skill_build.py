@@ -227,6 +227,8 @@ def build_skill(
         if base_model_cfg is not None:
             adapter_info.setdefault("model_name", base_model_cfg.name)
             adapter_info.setdefault("model_id", base_model_cfg.model_id)
+            if base_model_cfg.model_path:
+                adapter_info.setdefault("model_path", base_model_cfg.model_path)
             if base_model_cfg.cache_dir:
                 adapter_info.setdefault("cache_dir", base_model_cfg.cache_dir)
         else:
@@ -291,6 +293,5 @@ def build_skill(
     summary = skill_status_for_repo(repo_id, skill, export_root=export_root)
     summary["changed"] = True
     return summary
-
 
 

@@ -2,14 +2,14 @@ Architecture: Repository Library
 ================================
 
 This document describes the evolving architecture of the repository library system that:
-- Indexes repositories under `/data/repositories`.
+- Indexes repositories under `/data/repositories` and any configured extension roots.
 - Stores relationships in a graph database.
 - Provides LLM-based retrieval and Q&A using `meta-llama/Llama-3.1-8B-Instruct` from `/data/checkpoints`.
 
 ### 1. Core Concepts & Domain Model
 
 - **Repository**
-  - Physical path under `/data/repositories` (usually a Git repo).
+  - Physical path under a configured library root (usually a Git repo).
   - Metadata: name, description, primary language(s), size, last indexed commit, tags.
 
 - **File**
@@ -49,7 +49,7 @@ This initial schema should stay relatively small and pragmatic; it can be extend
 
 **Responsibilities**
 
-- Discover repositories under `/data/repositories`.
+- Discover repositories under `/data/repositories` plus configured extension roots.
 - For each repository:
   - Extract metadata (name, languages, git origin, branches).
   - Enumerate files; store file-level metadata in the graph.
@@ -59,7 +59,7 @@ This initial schema should stay relatively small and pragmatic; it can be extend
 **High-Level Flow**
 
 1. **Discovery**
-   - Scan `/data/repositories` for directories containing `.git` or for configured subpaths.
+   - Scan the default library root plus any configured extension roots for directories containing `.git` or other repository markers.
    - Maintain an ingestion state store (e.g., last indexed commit or timestamp).
 
 2. **Metadata Extraction**
@@ -210,5 +210,4 @@ Library-level code (planned) will provide:
 - Multi-user access control and security model.
 
 This document should evolve with implementation; treat it as a living design reference.
-
 

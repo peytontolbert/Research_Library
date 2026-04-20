@@ -19,6 +19,7 @@ import yaml
 class ModelConfig:
     name: str
     model_id: str
+    model_path: Optional[str]
     model_type: str
     cache_dir: Optional[str]
     model_description: Optional[str]
@@ -81,9 +82,13 @@ def _build_registry() -> Dict[str, ModelConfig]:
         model_id = str(rec.get("model_id") or "").strip()
         if not model_id:
             continue
+        model_path_any = rec.get("model_path")
+        if isinstance(model_path_any, str):
+            model_path = model_path_any.strip() or None
+        else:
+            model_path = None
         model_type = str(rec.get("model_type") or "").strip() or "causal-lm"
-        # Prefer `cache_dir` but fall back to legacy `model_path` if present.
-        cache_dir_val = rec.get("cache_dir", rec.get("model_path"))
+        cache_dir_val = rec.get("cache_dir")
         if isinstance(cache_dir_val, str):
             cache_dir = cache_dir_val.strip() or None
         else:
@@ -98,6 +103,7 @@ def _build_registry() -> Dict[str, ModelConfig]:
         cfg = ModelConfig(
             name=name,
             model_id=model_id,
+            model_path=model_path,
             model_type=model_type,
             cache_dir=cache_dir,
             model_description=desc,
@@ -134,6 +140,5 @@ def list_models() -> Dict[str, ModelConfig]:
     Return all known models keyed by logical name.
     """
     return dict(_ensure_registry())
-
 
 

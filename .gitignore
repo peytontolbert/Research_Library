@@ -22,3 +22,4 @@ python_algorithms/
 checkpoints/
 *.bin
 *.safetensors
+.tmp/

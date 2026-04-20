@@ -8,6 +8,7 @@ The current implementation focuses on:
 - Exporting a **per-repository program graph** as JSONL.
 - Maintaining a **library manifest** (`exports/_manifest.json`) with lightweight per-repo metadata.
 - Providing the foundations for **Repository objects** and **SkillSets** that higher-level services (Q&A, refactors, meta-learning) can use.
+- Exposing those capabilities to agent clients through a stdio MCP server.
 
 ### Goals
 
@@ -103,3 +104,19 @@ In the current codebase:
    - Add a minimal UI or CLI for interactive exploration.
 
 For deeper architecture details and design decisions, see `ARCHITECTURE.md`.
+
+### Agent Access
+
+Repository-aware agents can connect through the stdio MCP server:
+
+```bash
+PYTHONPATH=/data/repository_library /home/peyton/miniconda3/envs/ai/bin/python -m scripts.repo_library_mcp
+```
+
+There is also a helper to print a generic MCP config block:
+
+```bash
+python -m scripts.repo_library_mcp --print-config-json
+```
+
+See [docs/agent_access.md](docs/agent_access.md) for the tool inventory and the recommended flow for Codex, Claude Code, and other MCP-capable clients.

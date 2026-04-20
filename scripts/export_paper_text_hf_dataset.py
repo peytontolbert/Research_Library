@@ -38,6 +38,7 @@ DEFAULT_RAW_PDF_MAX_CHARS = 1_000_000
 DEFAULT_RAW_PDF_TIMEOUT_SECONDS = 8
 DEFAULT_PARQUET_BATCH_ROWS = 256
 PDF_SEARCH_ROOTS = [Path("exports/arxiv_pdfs"), Path("/arxiv/pdfs")]
+BACKFILL_PARQUET_GLOB = "paper_text_backfill_*.parquet"
 
 
 def _iter_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
@@ -60,6 +61,19 @@ def _iter_structured_rows(structured_dir: Path) -> Iterator[Dict[str, Any]]:
     for shard in sorted(structured_dir.glob("pdf_structured_*.jsonl")):
         for row in _iter_jsonl(shard):
             yield row
+    for shard in sorted(structured_dir.glob(BACKFILL_PARQUET_GLOB)):
+        try:
+            parquet_file = pq.ParquetFile(str(shard))
+        except Exception:
+            continue
+        for row_group_idx in range(parquet_file.num_row_groups):
+            try:
+                table = parquet_file.read_row_group(row_group_idx)
+            except Exception:
+                continue
+            for row in table.to_pylist():
+                if isinstance(row, dict):
+                    yield row
 
 
 def _normalize_space(text: str) -> str:
@@ -381,6 +395,106 @@ def _fallback_raw_pdf_text(
     return text, str(resolved_pdf), line_count, page_count
 
 
+def _preextracted_raw_text(
+    row: Dict[str, Any],
+) -> Tuple[str, int, int]:
+    inline_text = str(row.get("raw_text") or row.get("full_text") or "")
+    raw_text_path = str(row.get("raw_text_path") or "").strip()
+    text = inline_text
+    if not text and raw_text_path:
+        try:
+            text = Path(raw_text_path).read_text(encoding="utf-8")
+        except Exception:
+            text = ""
+    if not text:
+        return "", 0, 0
+
+    if "\x0c" in text:
+        normalized_text, line_count, page_count = _collapse_raw_pdf_text(text)
+    else:
+        normalized_text = str(text).strip()
+        line_count = len([line for line in normalized_text.splitlines() if line.strip()])
+        page_count = max(1, int(row.get("raw_text_page_count") or row.get("page_count") or 1))
+
+    try:
+        row_line_count = int(row.get("raw_text_line_count") or 0)
+        if row_line_count > 0:
+            line_count = row_line_count
+    except Exception:
+        pass
+
+    try:
+        row_page_count = int(row.get("raw_text_page_count") or 0)
+        if row_page_count > 0:
+            page_count = row_page_count
+    except Exception:
+        pass
+
+    return normalized_text, int(line_count), int(page_count)
+
+
+def _counter_from_token_type_counts_json(raw_value: Any) -> Counter[str]:
+    text = str(raw_value or "").strip()
+    if not text:
+        return Counter()
+    try:
+        obj = json.loads(text)
+    except Exception:
+        return Counter()
+    if not isinstance(obj, dict):
+        return Counter()
+    out: Counter[str] = Counter()
+    for key, value in obj.items():
+        try:
+            out[str(key)] += int(value)
+        except Exception:
+            continue
+    return out
+
+
+def _prebuilt_text_row(
+    row: Dict[str, Any],
+) -> Tuple[str, str, int, int, int, List[str], str, Counter[str]]:
+    text = str(row.get("text") or "").strip()
+    if not text:
+        return "", "", 0, 0, 0, [], "", Counter()
+
+    text_source = str(row.get("text_source") or "raw_pdf_preextracted").strip() or "raw_pdf_preextracted"
+    try:
+        page_count = int(row.get("page_count") or 0)
+    except Exception:
+        page_count = 0
+    try:
+        token_count = int(row.get("token_count") or row.get("text_line_count") or 0)
+    except Exception:
+        token_count = 0
+    token_types_any = row.get("token_types") or []
+    token_types = [str(token_type).strip() for token_type in token_types_any if str(token_type).strip()]
+    emit_type_counts = _counter_from_token_type_counts_json(row.get("token_type_counts_json"))
+    if not emit_type_counts and token_types and token_count > 0:
+        if len(token_types) == 1:
+            emit_type_counts = Counter({token_types[0]: token_count})
+        else:
+            emit_type_counts = Counter({token_type: 1 for token_type in token_types})
+    token_type_counts_json = str(row.get("token_type_counts_json") or "").strip()
+    if not token_type_counts_json:
+        token_type_counts_json = json.dumps(
+            dict(sorted(emit_type_counts.items())),
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+    return (
+        text,
+        text_source,
+        int(page_count),
+        int(token_count),
+        int(row.get("text_line_count") or token_count or len([ln for ln in text.splitlines() if ln.strip()])),
+        token_types,
+        token_type_counts_json,
+        emit_type_counts,
+    )
+
+
 def _write_dataset_card(
     *,
     output_dir: Path,
@@ -419,6 +533,7 @@ If the underlying shards were produced with truncated PDF preprocessing, the `te
 - `train`: `{rows_written}` papers
 - with matched arXiv metadata: `{metadata_covered}`
 - structured-token rows: `{text_source_counts.get('combined_structured_tokens', 0)}`
+- pre-extracted raw-text rows: `{text_source_counts.get('raw_pdf_preextracted', 0)}`
 - preferred raw-PDF rows: `{text_source_counts.get('raw_pdf_preferred', 0)}`
 - raw-PDF fallback rows: `{text_source_counts.get('raw_pdf_fallback', 0)}`
 
@@ -532,7 +647,31 @@ def export_paper_text_hf_dataset(
             token_type_counts_json = json.dumps({}, ensure_ascii=True, separators=(",", ":"))
             emit_type_counts: Counter[str] = Counter()
 
-            if prefer_raw_pdf_text:
+            prebuilt_text, prebuilt_source, prebuilt_page_count, prebuilt_token_count, prebuilt_line_count, prebuilt_token_types, prebuilt_counts_json, prebuilt_counts = _prebuilt_text_row(row)
+            if prebuilt_text:
+                text = prebuilt_text
+                page_count = prebuilt_page_count
+                text_source = prebuilt_source
+                token_count = prebuilt_token_count
+                token_types = prebuilt_token_types
+                token_type_counts_json = prebuilt_counts_json
+                emit_type_counts = prebuilt_counts
+            else:
+                preextracted_text, preextracted_line_count, preextracted_page_count = _preextracted_raw_text(row)
+                if preextracted_text:
+                    text = preextracted_text
+                    page_count = preextracted_page_count
+                    text_source = "raw_pdf_preextracted"
+                    token_count = preextracted_line_count
+                    token_types = ["raw_text_preextracted"]
+                    token_type_counts_json = json.dumps(
+                        {"raw_text_preextracted": preextracted_line_count},
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                    )
+                    emit_type_counts = Counter({"raw_text_preextracted": preextracted_line_count})
+
+            if not text and prefer_raw_pdf_text:
                 preferred_text, preferred_pdf_path, preferred_line_count, preferred_page_count = _fallback_raw_pdf_text(
                     raw_paper_id,
                     pdf_path,
@@ -621,11 +760,19 @@ def export_paper_text_hf_dataset(
                 "metadata_found": bool(meta),
                 "text": text,
                 "text_source": text_source,
-                "text_is_partial": not (
-                    text_source in {"raw_pdf_preferred", "raw_pdf_fallback"} and int(raw_pdf_max_chars) <= 0
+                "text_is_partial": bool(row.get("text_is_partial"))
+                if prebuilt_text
+                else not (
+                    text_source == "raw_pdf_preextracted"
+                    or (
+                        text_source in {"raw_pdf_preferred", "raw_pdf_fallback"}
+                        and int(raw_pdf_max_chars) <= 0
+                    )
                 ),
                 "text_char_count": len(text),
-                "text_line_count": len([ln for ln in text.splitlines() if ln.strip()]),
+                "text_line_count": prebuilt_line_count
+                if prebuilt_text
+                else len([ln for ln in text.splitlines() if ln.strip()]),
                 "token_count": token_count,
                 "page_count": int(page_count),
                 "token_types": token_types,
