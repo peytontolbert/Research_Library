@@ -107,6 +107,28 @@ def _iter_backfill_parquet_rows(structured_dir: Path) -> Iterator[Dict[str, Any]
                     yield row
 
 
+def _iter_backfill_parquet_canonical_ids(structured_dir: Path) -> Iterator[str]:
+    if not structured_dir.exists():
+        return
+    for shard in sorted(structured_dir.glob(BACKFILL_PARQUET_GLOB)):
+        try:
+            parquet_file = pq.ParquetFile(str(shard))
+        except Exception:
+            continue
+        if "canonical_paper_id" not in parquet_file.schema_arrow.names:
+            continue
+        for row_group_idx in range(parquet_file.num_row_groups):
+            try:
+                table = parquet_file.read_row_group(row_group_idx, columns=["canonical_paper_id"])
+            except Exception:
+                continue
+            values = table.column("canonical_paper_id").to_pylist()
+            for value in values:
+                paper_id = _canonical_paper_id(str(value or "").strip())
+                if paper_id:
+                    yield paper_id
+
+
 def _paper_id_from_row(row: Dict[str, Any]) -> str:
     explicit = str(row.get("paper_id") or "").strip()
     if explicit:
@@ -144,10 +166,8 @@ def _existing_paper_ids(structured_dirs: Sequence[Path]) -> Set[str]:
             paper_id = _canonical_paper_id(_paper_id_from_row(row))
             if paper_id:
                 paper_ids.add(paper_id)
-        for row in _iter_backfill_parquet_rows(structured_dir):
-            paper_id = _canonical_paper_id(_paper_id_from_row(row))
-            if paper_id:
-                paper_ids.add(paper_id)
+        for paper_id in _iter_backfill_parquet_canonical_ids(structured_dir):
+            paper_ids.add(paper_id)
     return paper_ids
 
 

@@ -42,6 +42,64 @@ The **export pipeline** in `build.py` and `scripts/library_repo_graph_export.py`
   - `{repo_id}.artifacts.jsonl`
 - Updating a shared manifest in `exports/_manifest.json` with per-repo metadata and (in later steps) skillset information.
 
+### Public Datasets Created From This Repo
+
+This repository also contains the scripts used to publish public Hugging Face datasets derived from those exports.
+
+#### `PeytonT/repo_graph`
+
+Dataset: [huggingface.co/datasets/PeytonT/repo_graph](https://huggingface.co/datasets/PeytonT/repo_graph)
+
+Relevant scripts:
+
+- `scripts/library_repo_graph_export.py` builds the per-repo graph exports under `exports/`.
+- `scripts/export_library_repo_graph_hf_dataset.py` converts those exports into a Hugging Face-ready parquet dataset and dataset card.
+
+What the dataset is:
+
+- A parquet-first snapshot of the repository library's program graph.
+- It preserves both the per-repository graph exports and the aggregated universe graph.
+- The published configs are `repos`, `entities`, `edges`, `artifacts`, `universe_nodes`, `universe_edges`, and `repo_knn`.
+- `repos` contains repository metadata plus optional 3D universe coordinates.
+- `entities` contains graph nodes such as files, modules, classes, and functions.
+- `edges` contains intra-repo graph relationships such as ownership and references.
+- `artifacts` contains artifact URIs and hashes, not full file contents.
+- `universe_nodes` and `universe_edges` capture the cross-repository universe projection.
+- `repo_knn` is a repository-to-repository nearest-neighbor graph with edge weights.
+
+Current public snapshot:
+
+- As published on April 19, 2026, the public dataset contains `15,499,276` total rows across all configs.
+- That includes `178` repo rows, `906,024` entities, `8,402,561` per-repo edges, `453,278` artifacts, `216,987` universe nodes, `5,518,898` universe edges, and `1,350` repo-to-repo KNN edges.
+- In practical terms, it is a large machine-readable map of the code library rather than a source-code dump.
+
+#### `PeytonT/100k_papers_text`
+
+Dataset: [huggingface.co/datasets/PeytonT/100k_papers_text](https://huggingface.co/datasets/PeytonT/100k_papers_text)
+
+Relevant scripts:
+
+- `scripts/export_paper_text_hf_dataset.py` emits one row per paper and publishes the Hugging Face dataset.
+- `scripts/backfill_missing_paper_text_shards.py` fills in missing full-text rows from local arXiv PDFs.
+- `scripts/backfill_paper_text_from_gcs.py` grows the corpus by temporarily downloading missing PDFs from GCS and writing parquet backfill shards.
+- `scripts/distributed_paper_text_backfill.py` coordinates that same backfill workflow across multiple workers.
+- `scripts/merge_paper_text_parquets.py` merges base exports plus backfills and dedupes on `canonical_paper_id`.
+
+What the dataset is:
+
+- A public full-text paper dataset with one row per arXiv paper.
+- Each row includes `paper_id`, `canonical_paper_id`, `paper_version`, `pdf_path`, `title`, `abstract`, `authors`, `categories`, `license`, and the extracted `text`.
+- The export also records provenance fields such as `text_source`, `text_is_partial`, `text_char_count`, `page_count`, `token_count`, and `token_types`.
+- The key idea is that the dataset is not just raw text; it keeps enough metadata to trace where the text came from and whether it was reconstructed from structured tokens or extracted directly from PDFs.
+
+Current public snapshot:
+
+- As published on April 19, 2026, the public dataset contains `100,569` papers, all with matched arXiv metadata.
+- `100,549` rows came from preferred raw-PDF extraction, `17` rows came from the structured-token export, and `3` rows came from raw-PDF fallback extraction.
+- The export was generated with `--prefer-raw-pdf-text` and `--raw-pdf-max-chars 0`, which means the PDF-sourced rows are intended to be full-document extracts rather than capped snippets.
+- License metadata matters here: `60,005` rows use arXiv's `nonexclusive-distrib` license, while many others use Creative Commons licenses such as CC BY 4.0.
+- In practical terms, this dataset is a public text corpus for paper-scale retrieval, search, and training workflows, with enough metadata to filter by license and provenance before reuse.
+
 ### SkillSets (Per-Repository Skills)
 
 On top of the graph and indices, each repo can expose a `SkillSet` – a collection of adapters and tools specialized for different workflows:

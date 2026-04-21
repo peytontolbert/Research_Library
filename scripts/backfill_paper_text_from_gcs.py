@@ -66,8 +66,27 @@ DEFAULT_EXTRACT_WORKERS = max(1, min(8, int(os.cpu_count() or 1)))
 DEFAULT_RETRY_MISSING_DOWNLOADS = False
 
 
+def _split_legacy_archive_id(raw_paper_id: str) -> Optional[Tuple[str, str]]:
+    paper_id = str(raw_paper_id or "").strip()
+    if "/" not in paper_id:
+        return None
+    archive, local_id = paper_id.split("/", 1)
+    archive = archive.strip()
+    local_id = local_id.strip()
+    if not archive or len(local_id) < 4 or not local_id[:4].isdigit():
+        return None
+    return archive, local_id
+
+
 def _extract_year(raw: Dict[str, Any]) -> Optional[int]:
     paper_id = str(raw.get("id") or "").strip()
+    legacy_parts = _split_legacy_archive_id(paper_id)
+    if legacy_parts is not None:
+        _, local_id = legacy_parts
+        yy = local_id[:2]
+        if yy.isdigit():
+            yy_int = int(yy)
+            return 1900 + yy_int if yy_int >= 90 else 2000 + yy_int
     if len(paper_id) >= 4 and paper_id[:4].isdigit():
         return 2000 + int(paper_id[:2])
 
@@ -98,7 +117,15 @@ def _download_candidates(raw: Dict[str, Any], *, gcs_prefix: str) -> List[Dict[s
     canonical_paper_id = str(raw.get("id") or "").strip()
     if not canonical_paper_id:
         return []
-    year_prefix = canonical_paper_id[:4]
+    legacy_parts = _split_legacy_archive_id(canonical_paper_id)
+    is_legacy = legacy_parts is not None
+    if is_legacy:
+        archive_prefix, local_id = legacy_parts or ("", "")
+        path_prefix = f"{str(gcs_prefix).rstrip('/').removesuffix('/pdf')}/{archive_prefix}/pdf/{local_id[:4]}"
+    elif len(canonical_paper_id) >= 4 and canonical_paper_id[:4].isdigit():
+        path_prefix = f"{str(gcs_prefix).rstrip('/')}/{canonical_paper_id[:4]}"
+    else:
+        return []
     versions = raw.get("versions")
     out: List[Dict[str, str]] = []
     seen: Set[str] = set()
@@ -113,8 +140,9 @@ def _download_candidates(raw: Dict[str, Any], *, gcs_prefix: str) -> List[Dict[s
             if paper_id in seen:
                 continue
             seen.add(paper_id)
-            remote_name = f"{paper_id}.pdf"
-            pdf_path = f"{str(gcs_prefix).rstrip('/')}/{year_prefix}/{remote_name}"
+            stem = f"{local_id}{paper_version}" if is_legacy else paper_id
+            remote_name = f"{stem}.pdf"
+            pdf_path = f"{path_prefix}/{remote_name}"
             out.append(
                 {
                     "paper_id": paper_id,
@@ -125,7 +153,8 @@ def _download_candidates(raw: Dict[str, Any], *, gcs_prefix: str) -> List[Dict[s
             )
     if out:
         return out
-    pdf_path = f"{str(gcs_prefix).rstrip('/')}/{year_prefix}/{canonical_paper_id}.pdf"
+    stem = local_id if is_legacy else canonical_paper_id
+    pdf_path = f"{path_prefix}/{stem}.pdf"
     return [
         {
             "paper_id": canonical_paper_id,
@@ -179,8 +208,6 @@ def _iter_metadata_candidates(
 
             canonical_paper_id = str(raw.get("id") or "").strip()
             if not canonical_paper_id:
-                continue
-            if len(canonical_paper_id) < 4 or not canonical_paper_id[:4].isdigit():
                 continue
 
             categories = str(raw.get("categories") or "").strip()
@@ -282,10 +309,11 @@ def _run_gsutil_cp_one(url: str, dest_dir: Path) -> bool:
 
 
 def _find_downloaded_pdf(batch_dir: Path, canonical_paper_id: str) -> Optional[Path]:
-    exact = sorted(batch_dir.rglob(f"{canonical_paper_id}.pdf"))
+    filename_stem = Path(str(canonical_paper_id or "").strip()).name
+    exact = sorted(batch_dir.rglob(f"{filename_stem}.pdf"))
     if exact:
         return exact[0]
-    fuzzy = sorted(batch_dir.rglob(f"{canonical_paper_id}*.pdf"))
+    fuzzy = sorted(batch_dir.rglob(f"{filename_stem}*.pdf"))
     return fuzzy[0] if fuzzy else None
 
 

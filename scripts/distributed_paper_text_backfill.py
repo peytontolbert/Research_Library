@@ -196,8 +196,8 @@ class DistributedBackfillCoordinator:
             out_dir=self.out_dir,
         )
         self.covered_ids_before = len(self.covered_ids)
-        self.extracted_rows = self._count_existing_output_rows()
-        self.requested_new_rows = self._requested_new_rows()
+        self.output_rows_before = self._count_existing_output_rows()
+        self.extracted_rows = self.output_rows_before
 
         self.metadata_scanned = 0
         self.metadata_matched = 0
@@ -241,27 +241,26 @@ class DistributedBackfillCoordinator:
                 parquet_file = pq.ParquetFile(str(shard_path))
             except Exception:
                 continue
-            for row_group_idx in range(parquet_file.num_row_groups):
-                try:
-                    table = parquet_file.read_row_group(row_group_idx, columns=["canonical_paper_id"])
-                except Exception:
-                    continue
-                count += len(table)
+            try:
+                count += int(parquet_file.metadata.num_rows)
+            except Exception:
+                continue
         return count
 
-    def _requested_new_rows(self) -> Optional[int]:
-        requested: Optional[int] = None
-        if self.max_papers > 0:
-            requested = self.max_papers
+    def _new_rows_this_run(self) -> int:
+        return max(0, int(self.extracted_rows) - int(self.output_rows_before))
+
+    def _remaining_target_rows_locked(self) -> Optional[int]:
+        remaining: Optional[int] = None
         if self.target_total_papers > 0:
-            needed = max(0, self.target_total_papers - self.covered_ids_before)
-            requested = needed if requested is None else min(requested, needed)
-        return requested
+            remaining = max(0, int(self.target_total_papers) - int(len(self.covered_ids)))
+        if self.max_papers > 0:
+            remaining_new_rows = max(0, int(self.max_papers) - int(self._new_rows_this_run()))
+            remaining = remaining_new_rows if remaining is None else min(remaining, remaining_new_rows)
+        return remaining
 
     def _snapshot_locked(self) -> Dict[str, Any]:
-        remaining = None
-        if self.requested_new_rows is not None:
-            remaining = max(0, int(self.requested_new_rows) - int(self.extracted_rows))
+        remaining = self._remaining_target_rows_locked()
         return {
             "status": self.status,
             "metadata_path": str(self.metadata_path),
@@ -355,7 +354,9 @@ class DistributedBackfillCoordinator:
         if self.iterator_exhausted:
             return
         while len(self.pending_records) < target_records:
-            if self.requested_new_rows is not None and self.extracted_rows >= self.requested_new_rows:
+            if self.target_total_papers > 0 and len(self.covered_ids) >= self.target_total_papers:
+                break
+            if self.max_papers > 0 and self._new_rows_this_run() >= self.max_papers:
                 break
             try:
                 record = next(self.iterator)
@@ -373,7 +374,9 @@ class DistributedBackfillCoordinator:
             self.pending_records.append(record)
 
     def _maybe_complete_locked(self) -> None:
-        if self.requested_new_rows is not None and self.extracted_rows >= self.requested_new_rows:
+        if self.target_total_papers > 0 and len(self.covered_ids) >= self.target_total_papers:
+            self.status = "completed"
+        elif self.max_papers > 0 and self._new_rows_this_run() >= self.max_papers:
             self.status = "completed"
         elif self.iterator_exhausted and not self.pending_records and not self.leases:
             self.status = "completed"

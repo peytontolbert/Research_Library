@@ -11,6 +11,42 @@ papers without repeatedly hitting external APIs.
   - `arxiv-metadata-oai-snapshot.json` — line-delimited JSON, one paper per line.
   - Additional CSV/JSON files may be present depending on the specific Kaggle
     bundle, but the metadata JSON snapshot is the primary artifact.
+  - `arxiv-metadata-oai-state.json` — optional sync state written by the
+    incremental refresh script described below.
+
+### Refreshing the snapshot
+
+The repository now includes an official refresh path:
+
+- Script: `python -m scripts.refresh_arxiv_metadata`
+- Upstream source: arXiv's OAI-PMH endpoint at
+  `https://oaipmh.arxiv.org/oai`
+- Metadata format: `arXivRaw`
+
+This keeps the local JSONL snapshot shape already used by the repository while
+refreshing it from arXiv's own metadata feed instead of requiring a fresh
+manual Kaggle download each time.
+
+Typical usage:
+
+- Refresh incrementally using saved state or the existing snapshot cutoff:
+  - `python -m scripts.refresh_arxiv_metadata`
+- Preview what would be fetched without rewriting the snapshot:
+  - `python -m scripts.refresh_arxiv_metadata --dry-run --max-records 50`
+- Force a specific incremental starting point:
+  - `python -m scripts.refresh_arxiv_metadata --from-date 2026-04-01`
+- Perform a full harvest from arXiv's OAI endpoint:
+  - `python -m scripts.refresh_arxiv_metadata --full`
+
+Notes:
+
+- The script writes sync state to `/data/arxiv/arxiv-metadata-oai-state.json`
+  after a successful merge.
+- On the first incremental run, if no sync state exists yet, the script scans
+  the local snapshot and rewinds a small number of days before harvesting to
+  avoid missing late updates during the transition.
+- arXiv's OAI interface is designed for synchronization by record modification
+  date, not submission-date filtering.
 
 ### Metadata format (JSONL)
 
@@ -99,5 +135,4 @@ For now, the ArXiv metadata is **standalone** and not wired into the
 
 This document only covers **metadata**; full PDF content is intentionally out
 of scope and is not stored under `/data/arxiv` by default.
-
 

@@ -7,6 +7,7 @@ import pyarrow as pa  # type: ignore
 import pyarrow.parquet as pq  # type: ignore
 
 from scripts.backfill_paper_text_from_gcs import (
+    _download_candidates,
     _partition_matches,
     backfill_paper_text_from_gcs,
 )
@@ -283,3 +284,85 @@ def test_backfill_paper_text_from_gcs_uses_older_version_fallback_and_cleans_tem
     assert row["paper_version"] == "v1"
     assert row["pdf_path"].endswith("/2401/2401.12345v1.pdf")
     assert not list(out_dir.glob("*.tmp"))
+
+
+def test_download_candidates_support_legacy_slash_style_ids() -> None:
+    candidates = _download_candidates(
+        {
+            "id": "acc-phys/9411001",
+            "versions": [{"version": "v1"}],
+        },
+        gcs_prefix="gs://arxiv-dataset/arxiv/pdf",
+    )
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate["paper_id"] == "acc-phys/9411001v1"
+    assert candidate["paper_version"] == "v1"
+    assert candidate["gcs_url"] == "gs://arxiv-dataset/arxiv/acc-phys/pdf/9411/9411001v1.pdf"
+
+
+def test_backfill_paper_text_from_gcs_supports_legacy_slash_style_ids(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    metadata_path = tmp_path / "metadata.jsonl"
+    out_dir = tmp_path / "out"
+    temp_pdf_dir = tmp_path / "tmp_pdfs"
+
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "id": "acc-phys/9411001",
+                "title": "Legacy Paper",
+                "abstract": "Legacy abstract",
+                "authors": "Alice",
+                "categories": "physics.acc-ph",
+                "license": "cc-by",
+                "update_date": "1994-11-01",
+                "versions": [{"version": "v1"}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def fake_gsutil(urls, dest_dir):
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        for url in urls:
+            base_id = Path(str(url)).stem
+            (dest_dir / f"{base_id}.pdf").write_bytes(b"%PDF-1.4 fake\n")
+        return 0
+
+    def fake_extract_pdf_text(path: Path, *, max_chars: int, timeout_seconds: int) -> str:
+        return f"full text for {path.stem}"
+
+    monkeypatch.setattr("scripts.backfill_paper_text_from_gcs._run_gsutil_cp", fake_gsutil)
+    monkeypatch.setattr(
+        "scripts.backfill_paper_text_from_gcs._extract_pdf_text_fast",
+        fake_extract_pdf_text,
+    )
+
+    result = backfill_paper_text_from_gcs(
+        existing_structured_dirs=[],
+        existing_parquet_dirs=[],
+        existing_parquet_paths=[],
+        metadata_path=str(metadata_path),
+        out_dir=str(out_dir),
+        temp_pdf_dir=str(temp_pdf_dir),
+        progress_every=0,
+        delete_temp_pdfs=True,
+    )
+
+    stats = result["stats"]
+    assert stats["covered_ids_before"] == 0
+    assert stats["covered_ids_after"] == 1
+    assert stats["extracted_rows"] == 1
+    assert stats["downloaded_pdfs"] == 1
+
+    shard_paths = sorted(out_dir.glob("paper_text_backfill_*.parquet"))
+    assert len(shard_paths) == 1
+    row = pq.read_table(str(shard_paths[0])).to_pylist()[0]
+    assert row["canonical_paper_id"] == "acc-phys/9411001"
+    assert row["paper_id"] == "acc-phys/9411001v1"
+    assert row["paper_version"] == "v1"
+    assert row["pdf_path"] == "gs://arxiv-dataset/arxiv/acc-phys/pdf/9411/9411001v1.pdf"
