@@ -34,6 +34,7 @@ from scripts.backfill_missing_paper_text_shards import (
 )
 from scripts.backfill_paper_text_from_gcs import (
     DEFAULT_CATEGORY_PREFIX,
+    DEFAULT_DIRECT_ARXIV_PDF_FALLBACK,
     DEFAULT_DOWNLOAD_BATCH_SIZE,
     DEFAULT_EXTRACT_WORKERS,
     DEFAULT_GCS_PREFIX,
@@ -189,6 +190,8 @@ class DistributedBackfillCoordinator:
         if not self.metadata_path.is_file():
             raise FileNotFoundError(f"Metadata snapshot not found: {self.metadata_path}")
 
+        self.resume_metadata_offset = self._load_resume_metadata_offset()
+        self.next_metadata_offset = int(self.resume_metadata_offset)
         self.covered_ids = _covered_paper_ids(
             existing_structured_dirs=self.existing_structured_dirs,
             existing_parquet_dirs=self.existing_parquet_dirs,
@@ -209,6 +212,7 @@ class DistributedBackfillCoordinator:
         self.downloaded_pdfs = 0
         self.deleted_temp_pdfs = 0
         self.version_fallback_uses = 0
+        self.direct_pdf_fallback_uses = 0
         self.completed_shards = len(list(self.out_dir.glob("paper_text_backfill_*.parquet")))
         self.started_at = time.time()
 
@@ -218,6 +222,7 @@ class DistributedBackfillCoordinator:
         self.shard_idx = _next_shard_index(self.out_dir)
         self.active_shard_rows = 0
         self.rows_buffer: List[Dict[str, Any]] = []
+        self.open_shard_offsets: List[int] = []
 
         self.pending_records: Deque[Dict[str, Any]] = deque()
         self.leases: Dict[str, Dict[str, Any]] = {}
@@ -229,6 +234,7 @@ class DistributedBackfillCoordinator:
             max_year=self.max_year,
             keywords=self.keywords,
             gcs_prefix=self.gcs_prefix,
+            start_offset=self.resume_metadata_offset,
         )
         self.iterator_exhausted = False
         self.status = "running"
@@ -247,6 +253,34 @@ class DistributedBackfillCoordinator:
                 continue
         return count
 
+    def _resume_signature(self) -> Dict[str, Any]:
+        return {
+            "metadata_path": str(self.metadata_path),
+            "out_dir": str(self.out_dir),
+            "category_prefix": self.category_prefix,
+            "min_year": int(self.min_year),
+            "max_year": int(self.max_year),
+            "keywords": list(self.keywords),
+            "gcs_prefix": self.gcs_prefix,
+        }
+
+    def _load_resume_metadata_offset(self) -> int:
+        if not self.progress_path.is_file():
+            return 0
+        try:
+            payload = json.loads(self.progress_path.read_text(encoding="utf-8"))
+        except Exception:
+            return 0
+        if not isinstance(payload, dict):
+            return 0
+        for key, value in self._resume_signature().items():
+            if payload.get(key) != value:
+                return 0
+        try:
+            return max(0, int(payload.get("resume_metadata_offset") or 0))
+        except Exception:
+            return 0
+
     def _new_rows_this_run(self) -> int:
         return max(0, int(self.extracted_rows) - int(self.output_rows_before))
 
@@ -258,6 +292,24 @@ class DistributedBackfillCoordinator:
             remaining_new_rows = max(0, int(self.max_papers) - int(self._new_rows_this_run()))
             remaining = remaining_new_rows if remaining is None else min(remaining, remaining_new_rows)
         return remaining
+
+    def _resume_metadata_offset_locked(self) -> int:
+        offsets: List[int] = []
+        for record in self.pending_records:
+            try:
+                offsets.append(int(record.get("__metadata_start_offset") or 0))
+            except Exception:
+                continue
+        for lease in self.leases.values():
+            for record in (lease.get("records") or []):
+                try:
+                    offsets.append(int(record.get("__metadata_start_offset") or 0))
+                except Exception:
+                    continue
+        offsets.extend(int(offset) for offset in self.open_shard_offsets if int(offset) >= 0)
+        if offsets:
+            return min(offsets)
+        return int(self.next_metadata_offset)
 
     def _snapshot_locked(self) -> Dict[str, Any]:
         remaining = self._remaining_target_rows_locked()
@@ -279,6 +331,9 @@ class DistributedBackfillCoordinator:
             "downloaded_pdfs": int(self.downloaded_pdfs),
             "deleted_temp_pdfs": int(self.deleted_temp_pdfs),
             "version_fallback_uses": int(self.version_fallback_uses),
+            "direct_pdf_fallback_uses": int(self.direct_pdf_fallback_uses),
+            "resume_metadata_offset": int(self._resume_metadata_offset_locked()),
+            "next_metadata_offset": int(self.next_metadata_offset),
             "target_total_papers": int(self.target_total_papers),
             "max_papers": int(self.max_papers),
             "remaining_target_rows": None if remaining is None else int(remaining),
@@ -330,6 +385,7 @@ class DistributedBackfillCoordinator:
             self.current_tmp_path = None
             self.current_final_path = None
             self.active_shard_rows = 0
+            self.open_shard_offsets = []
             self.shard_idx += 1
             self.completed_shards += 1
 
@@ -363,6 +419,13 @@ class DistributedBackfillCoordinator:
             except StopIteration:
                 self.iterator_exhausted = True
                 break
+            try:
+                self.next_metadata_offset = max(
+                    int(self.next_metadata_offset),
+                    int(record.get("__metadata_end_offset") or self.next_metadata_offset),
+                )
+            except Exception:
+                pass
             self.metadata_scanned += 1
             canonical_paper_id = str(record.get("canonical_paper_id") or "").strip()
             if not canonical_paper_id:
@@ -457,6 +520,11 @@ class DistributedBackfillCoordinator:
                 for record in (lease.get("records") or [])
                 if str(record.get("canonical_paper_id") or "").strip()
             }
+            lease_offsets = {
+                str(record.get("canonical_paper_id") or "").strip(): int(record.get("__metadata_start_offset") or 0)
+                for record in (lease.get("records") or [])
+                if str(record.get("canonical_paper_id") or "").strip()
+            }
             row_ids = {
                 str(row.get("canonical_paper_id") or "").strip()
                 for row in rows
@@ -476,6 +544,7 @@ class DistributedBackfillCoordinator:
             self.downloaded_pdfs += int(worker_stats.get("downloaded_pdfs") or 0)
             self.deleted_temp_pdfs += int(worker_stats.get("deleted_temp_pdfs") or 0)
             self.version_fallback_uses += int(worker_stats.get("version_fallback_uses") or 0)
+            self.direct_pdf_fallback_uses += int(worker_stats.get("direct_pdf_fallback_uses") or 0)
 
             for row in rows:
                 canonical_paper_id = str(row.get("canonical_paper_id") or "").strip()
@@ -484,6 +553,7 @@ class DistributedBackfillCoordinator:
                 self.rows_buffer.append(dict(row))
                 self.covered_ids.add(canonical_paper_id)
                 self.extracted_rows += 1
+                self.open_shard_offsets.append(int(lease_offsets.get(canonical_paper_id, 0)))
                 if len(self.rows_buffer) >= self.row_group_rows:
                     self._flush_rows_locked()
 
@@ -596,7 +666,8 @@ def run_coordinator(
     local_max_records_per_lease: int,
     local_extract_workers: int,
     local_retry_missing_downloads: bool,
-    local_heartbeat_interval_seconds: int,
+    local_direct_arxiv_pdf_fallback: bool = DEFAULT_DIRECT_ARXIV_PDF_FALLBACK,
+    local_heartbeat_interval_seconds: int = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
 ) -> None:
     coordinator = DistributedBackfillCoordinator(
         auth_token=auth_token,
@@ -647,6 +718,7 @@ def run_coordinator(
                 "raw_pdf_timeout_seconds": int(raw_pdf_timeout_seconds),
                 "extract_workers": int(local_extract_workers or DEFAULT_EXTRACT_WORKERS),
                 "retry_missing_downloads": bool(local_retry_missing_downloads),
+                "direct_arxiv_pdf_fallback": bool(local_direct_arxiv_pdf_fallback),
                 "heartbeat_interval_seconds": int(
                     local_heartbeat_interval_seconds or DEFAULT_HEARTBEAT_INTERVAL_SECONDS
                 ),
@@ -685,7 +757,8 @@ def run_worker(
     raw_pdf_timeout_seconds: int,
     extract_workers: int,
     retry_missing_downloads: bool,
-    heartbeat_interval_seconds: int,
+    direct_arxiv_pdf_fallback: bool = DEFAULT_DIRECT_ARXIV_PDF_FALLBACK,
+    heartbeat_interval_seconds: int = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
 ) -> None:
     coordinator_url = coordinator_url.rstrip("/") + "/"
     worker_id = str(worker_id or uuid.uuid4())
@@ -727,6 +800,7 @@ def run_worker(
         skipped_empty = 0
         missing_downloads = 0
         version_fallback_uses = 0
+        direct_pdf_fallback_uses = 0
         rows: List[Dict[str, Any]] = []
 
         heartbeat_stop = threading.Event()
@@ -761,16 +835,19 @@ def run_worker(
         try:
             resolved_records: List[Tuple[Dict[str, Any], Path]] = []
             for record in records:
-                resolved_record, pdf_path, used_fallback = _resolve_download_candidate(
+                resolved_record, pdf_path, used_fallback, used_direct_pdf_fallback = _resolve_download_candidate(
                     record,
                     batch_dir=batch_dir,
                     retry_missing_downloads=bool(retry_missing_downloads),
+                    direct_arxiv_pdf_fallback=bool(direct_arxiv_pdf_fallback),
                 )
                 if resolved_record is None or pdf_path is None:
                     missing_downloads += 1
                     continue
                 if used_fallback:
                     version_fallback_uses += 1
+                if used_direct_pdf_fallback:
+                    direct_pdf_fallback_uses += 1
                 resolved_records.append((resolved_record, pdf_path))
 
             if extract_workers <= 1 or len(resolved_records) <= 1:
@@ -828,6 +905,7 @@ def run_worker(
                         "skipped_empty": int(skipped_empty),
                         "missing_downloads": int(missing_downloads),
                         "version_fallback_uses": int(version_fallback_uses),
+                        "direct_pdf_fallback_uses": int(direct_pdf_fallback_uses),
                     },
                 },
             gzip_body=True,
@@ -893,6 +971,11 @@ def main() -> None:
     )
     coordinator.add_argument("--local-retry-missing-downloads", action="store_true")
     coordinator.add_argument(
+        "--disable-local-direct-arxiv-pdf-fallback",
+        action="store_true",
+        help="Disable direct https://arxiv.org/pdf fallback for coordinator-host local workers.",
+    )
+    coordinator.add_argument(
         "--local-heartbeat-interval-seconds",
         type=int,
         default=DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
@@ -910,6 +993,7 @@ def main() -> None:
     worker.add_argument("--raw-pdf-timeout-seconds", type=int, default=DEFAULT_RAW_PDF_TIMEOUT_SECONDS)
     worker.add_argument("--extract-workers", type=int, default=DEFAULT_EXTRACT_WORKERS)
     worker.add_argument("--retry-missing-downloads", action="store_true")
+    worker.add_argument("--disable-direct-arxiv-pdf-fallback", action="store_true")
     worker.add_argument("--heartbeat-interval-seconds", type=int, default=DEFAULT_HEARTBEAT_INTERVAL_SECONDS)
 
     args = parser.parse_args()
@@ -944,6 +1028,7 @@ def main() -> None:
             local_max_records_per_lease=int(args.local_max_records_per_lease or DEFAULT_LEASE_SIZE),
             local_extract_workers=int(args.local_extract_workers or DEFAULT_EXTRACT_WORKERS),
             local_retry_missing_downloads=bool(args.local_retry_missing_downloads),
+            local_direct_arxiv_pdf_fallback=not bool(args.disable_local_direct_arxiv_pdf_fallback),
             local_heartbeat_interval_seconds=int(
                 args.local_heartbeat_interval_seconds or DEFAULT_HEARTBEAT_INTERVAL_SECONDS
             ),
@@ -961,6 +1046,7 @@ def main() -> None:
         raw_pdf_timeout_seconds=int(args.raw_pdf_timeout_seconds),
         extract_workers=int(args.extract_workers or DEFAULT_EXTRACT_WORKERS),
         retry_missing_downloads=bool(args.retry_missing_downloads or DEFAULT_RETRY_MISSING_DOWNLOADS),
+        direct_arxiv_pdf_fallback=not bool(args.disable_direct_arxiv_pdf_fallback),
         heartbeat_interval_seconds=int(args.heartbeat_interval_seconds or DEFAULT_HEARTBEAT_INTERVAL_SECONDS),
     )
 

@@ -35,6 +35,22 @@ DEFAULT_ROWS_PER_OUTPUT_FILE = 100_000
 DEFAULT_COMPRESSION = "zstd"
 DEFAULT_METADATA_BATCH_ROWS = 4096
 DEFAULT_MEMORY_LIMIT = "8GB"
+DEFAULT_TARGET_ROWS = 0
+
+
+def _size_category_for_rows(row_count: int) -> str:
+    rows = int(row_count or 0)
+    if rows < 1_000:
+        return "n<1K"
+    if rows < 10_000:
+        return "1K<n<10K"
+    if rows < 100_000:
+        return "10K<n<100K"
+    if rows < 1_000_000:
+        return "100K<n<1M"
+    if rows < 10_000_000:
+        return "1M<n<10M"
+    return "n>10M"
 
 
 def _quote_sql_string(value: str) -> str:
@@ -125,29 +141,84 @@ def _write_dataset_card(
     backfill_rows: int,
     merged_unique_canonical_ids: int,
     output_files: Sequence[Path],
+    target_rows: int = 0,
+    pre_limit_merged_rows: Optional[int] = None,
 ) -> Path:
     files_block = "\n".join(f"- `{path.name}`" for path in output_files)
+    release_note = ""
+    if int(target_rows or 0) > 0:
+        release_note = (
+            f"This release is capped deterministically at exactly `{int(target_rows)}` "
+            "deduped papers."
+        )
+    if pre_limit_merged_rows is not None and int(pre_limit_merged_rows) != int(merged_rows):
+        if release_note:
+            release_note += " "
+        release_note += (
+            f"The selected inputs contained `{int(pre_limit_merged_rows)}` deduped papers before applying the cap."
+        )
+    size_category = _size_category_for_rows(merged_rows)
     readme = f"""---
-pretty_name: Paper Text Deduped Merge
+pretty_name: Deduped Paper Text Dataset
 viewer: true
 tags:
 - datasets
 - arxiv
 - scientific-papers
 - text
+size_categories:
+- {size_category}
 ---
 
-# Paper Text Deduped Merge
+# Deduped Paper Text Dataset
 
 This dataset merges an existing paper-text parquet export with one or more
 backfill parquet shards, then keeps exactly one row per `canonical_paper_id`.
 
-## Counts
+One row corresponds to one canonical arXiv paper. Where multiple versions are
+available, the merge keeps the strongest text row according to the repo's
+selection logic: prefer non-partial text, then prefer raw-PDF-derived text,
+then newer versions, then longer text.
 
-- merged rows: `{merged_rows}`
-- merged unique canonical papers: `{merged_unique_canonical_ids}`
-- base input rows: `{base_rows}`
-- backfill input rows: `{backfill_rows}`
+## Important provenance note
+
+This is a merged release, not a fresh one-pass export. It combines an earlier
+deduped paper-text dataset with later backfill shards, then dedupes again on
+`canonical_paper_id`.
+
+Use per-paper `license` filtering before broad downstream publication. Many
+arXiv records still carry `nonexclusive-distrib` rather than a general reuse
+license.
+
+{release_note}
+
+## Rows
+
+- `train`: `{merged_rows}` papers
+- unique canonical papers: `{merged_unique_canonical_ids}`
+- base input rows considered: `{base_rows}`
+- backfill input rows considered: `{backfill_rows}`
+"""
+    if pre_limit_merged_rows is not None and int(pre_limit_merged_rows) != int(merged_rows):
+        readme += f"- deduped rows before target cap: `{int(pre_limit_merged_rows)}`\n"
+    readme += f"""
+
+## Main columns
+
+- `paper_id`
+- `canonical_paper_id`
+- `paper_version`
+- `pdf_path`
+- `title`
+- `abstract`
+- `authors`
+- `categories`
+- `license`
+- `text`
+- `text_char_count`
+- `token_count`
+- `page_count`
+- `token_types`
 
 ## Files
 
@@ -461,6 +532,16 @@ def _stream_winner_rows_to_parquet(
     return output_paths
 
 
+def _winner_selection_order(item: Tuple[str, Tuple[str, str]]) -> Tuple[int, str, str]:
+    canonical_paper_id, winner = item
+    source_bucket, paper_id = winner
+    return (
+        0 if str(source_bucket) == "base" else 1,
+        str(paper_id or ""),
+        str(canonical_paper_id or ""),
+    )
+
+
 def merge_paper_text_parquets(
     *,
     base_parquets: Sequence[str],
@@ -472,6 +553,7 @@ def merge_paper_text_parquets(
     rows_per_output_file: int = DEFAULT_ROWS_PER_OUTPUT_FILE,
     compression: str = DEFAULT_COMPRESSION,
     memory_limit: str = DEFAULT_MEMORY_LIMIT,
+    target_rows: int = DEFAULT_TARGET_ROWS,
     keep_temp: bool = False,
 ) -> Dict[str, Any]:
     base_paths = _expand_parquet_inputs(base_parquets, base_parquet_dirs)
@@ -555,19 +637,8 @@ def merge_paper_text_parquets(
             """
         )
 
-        canonical_ids = {
-            str(row[0])
-            for row in con.execute("select canonical_paper_id from winners").fetchall()
-            if row and str(row[0] or "").strip()
-        }
-        metadata_by_id = _load_metadata_map(
-            metadata_path=metadata_path_obj,
-            canonical_ids=canonical_ids,
-        )
-        metadata_rows = len(metadata_by_id)
-
-        merged_rows = int(con.execute("select count(*) from winners").fetchone()[0])
-        merged_unique_canonical_ids = int(
+        merged_rows_before_target_cap = int(con.execute("select count(*) from winners").fetchone()[0])
+        merged_unique_canonical_ids_before_target_cap = int(
             con.execute("select count(distinct canonical_paper_id) from winners").fetchone()[0]
         )
         rows_per_file = max(1, int(rows_per_output_file))
@@ -578,6 +649,26 @@ def merge_paper_text_parquets(
             ).fetchall()
             if str(canonical_paper_id or "").strip()
         }
+        rows_target = max(0, int(target_rows))
+        if rows_target > 0 and len(winners) > rows_target:
+            selected_ids = [
+                canonical_paper_id
+                for canonical_paper_id, _winner in sorted(winners.items(), key=_winner_selection_order)
+            ][:rows_target]
+            selected_id_set = set(selected_ids)
+            winners = {
+                canonical_paper_id: winner
+                for canonical_paper_id, winner in winners.items()
+                if canonical_paper_id in selected_id_set
+            }
+        canonical_ids = set(winners.keys())
+        metadata_by_id = _load_metadata_map(
+            metadata_path=metadata_path_obj,
+            canonical_ids=canonical_ids,
+        )
+        metadata_rows = len(metadata_by_id)
+        merged_rows = len(winners)
+        merged_unique_canonical_ids = len(winners)
         output_paths = _stream_winner_rows_to_parquet(
             base_paths=base_paths,
             backfill_paths=backfill_paths,
@@ -595,6 +686,8 @@ def merge_paper_text_parquets(
             backfill_rows=backfill_rows,
             merged_unique_canonical_ids=merged_unique_canonical_ids,
             output_files=output_paths,
+            target_rows=rows_target,
+            pre_limit_merged_rows=merged_rows_before_target_cap,
         )
 
         stats = {
@@ -606,6 +699,9 @@ def merge_paper_text_parquets(
             "backfill_rows": backfill_rows,
             "merged_rows": merged_rows,
             "merged_unique_canonical_ids": merged_unique_canonical_ids,
+            "target_rows": rows_target,
+            "merged_rows_before_target_cap": merged_rows_before_target_cap,
+            "merged_unique_canonical_ids_before_target_cap": merged_unique_canonical_ids_before_target_cap,
             "metadata_subset_rows": metadata_rows,
             "rows_per_output_file": rows_per_file,
             "memory_limit": str(memory_limit),
@@ -671,6 +767,12 @@ def main() -> None:
         default=DEFAULT_MEMORY_LIMIT,
         help="DuckDB memory limit before spilling to disk. Default: 8GB.",
     )
+    parser.add_argument(
+        "--target-rows",
+        type=int,
+        default=DEFAULT_TARGET_ROWS,
+        help="Optional exact cap on deduped output rows. Default: unlimited.",
+    )
     parser.add_argument("--keep-temp", action="store_true")
     args = parser.parse_args()
 
@@ -684,6 +786,7 @@ def main() -> None:
         rows_per_output_file=int(args.rows_per_output_file),
         compression=str(args.compression or DEFAULT_COMPRESSION),
         memory_limit=str(args.memory_limit or DEFAULT_MEMORY_LIMIT),
+        target_rows=int(args.target_rows or DEFAULT_TARGET_ROWS),
         keep_temp=bool(args.keep_temp),
     )
     print(json.dumps(result, indent=2))

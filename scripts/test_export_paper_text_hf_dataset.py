@@ -224,6 +224,7 @@ def test_export_paper_text_hf_dataset_uses_raw_pdf_fallback(
         metadata_path=str(metadata_path),
         output_dir=str(output_dir),
         write_dataset_dict=True,
+        raw_pdf_fallback=True,
     )
 
     assert result["stats"]["rows_written"] == 1
@@ -239,6 +240,57 @@ def test_export_paper_text_hf_dataset_uses_raw_pdf_fallback(
     assert row["page_count"] == 2
     assert row["token_types"] == ["raw_text_fallback"]
     assert "Fallback page one." in row["text"]
+
+
+def test_export_paper_text_hf_dataset_does_not_use_raw_pdf_fallback_by_default(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    structured_dir = tmp_path / "pdfs_structured"
+    structured_dir.mkdir(parents=True, exist_ok=True)
+    raw_text_path = tmp_path / "arxiv_cache" / "2401" / "raw_default_disabled.txt"
+    raw_text_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_text_path.write_text("placeholder", encoding="utf-8")
+
+    (structured_dir / "pdf_structured_00000.jsonl").write_text(
+        json.dumps(
+            {
+                "paper_id": "2401.00008v1",
+                "pdf_path": str(raw_text_path),
+                "tokens": [{"type": "text", "text": "PDF_PATH::" + str(raw_text_path), "page": 1, "line_no": 1}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    metadata_path = tmp_path / "arxiv-metadata-oai-snapshot.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "id": "2401.00008",
+                "title": "Paper Eight",
+                "versions": [{"version": "v1"}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "scripts.export_paper_text_hf_dataset.extract_pdf_text",
+        lambda path, max_chars=0: "This should not be used.\n",
+    )
+
+    output_dir = tmp_path / "hf_out"
+    result = export_paper_text_hf_dataset(
+        structured_dir=str(structured_dir),
+        metadata_path=str(metadata_path),
+        output_dir=str(output_dir),
+    )
+
+    assert result["stats"]["rows_written"] == 0
+    assert result["stats"]["text_source_counts"] == {}
 
 
 def test_export_paper_text_hf_dataset_skips_jsonl_by_default(tmp_path: Path) -> None:

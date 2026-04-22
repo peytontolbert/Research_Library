@@ -7,9 +7,10 @@ Hugging Face-ready dataset on local disk, with optional Hub push.
 Important: this exporter reflects the current structured PDF shards. If those
 shards were built with truncated PDF preprocessing (for example `--max-pages 3`)
 then the resulting paper text is partial. The dataset card and exported rows
-carry that provenance explicitly. To recover full paper text for an existing
-paper set, use `--prefer-raw-pdf-text` so each paper row is re-extracted from
-the source PDF instead of the truncated structured tokens.
+carry that provenance explicitly. By default the exporter does not reopen local
+PDFs. To recover full paper text for an existing paper set, use
+`--prefer-raw-pdf-text` so each paper row is re-extracted from the source PDF
+instead of the truncated structured tokens.
 """
 
 import argparse
@@ -570,7 +571,7 @@ def export_paper_text_hf_dataset(
     output_dir: str = str(DEFAULT_OUTPUT_DIR),
     include_types: Optional[Sequence[str]] = None,
     dedupe_consecutive: bool = True,
-    raw_pdf_fallback: bool = True,
+    raw_pdf_fallback: bool = False,
     raw_pdf_max_chars: int = DEFAULT_RAW_PDF_MAX_CHARS,
     raw_pdf_timeout_seconds: int = DEFAULT_RAW_PDF_TIMEOUT_SECONDS,
     parquet_batch_rows: int = DEFAULT_PARQUET_BATCH_ROWS,
@@ -920,9 +921,9 @@ def main() -> None:
         help="Do not remove immediately repeated consecutive lines.",
     )
     parser.add_argument(
-        "--disable-raw-pdf-fallback",
+        "--enable-raw-pdf-fallback",
         action="store_true",
-        help="Do not fall back to raw PDF text when the structured row has no usable text.",
+        help="Allow raw PDF fallback when the structured row has no usable text. Disabled by default.",
     )
     parser.add_argument(
         "--raw-pdf-max-chars",
@@ -990,7 +991,7 @@ def main() -> None:
         output_dir=args.output_dir,
         include_types=args.include_types,
         dedupe_consecutive=not bool(args.no_dedupe_consecutive),
-        raw_pdf_fallback=not bool(args.disable_raw_pdf_fallback),
+        raw_pdf_fallback=bool(args.enable_raw_pdf_fallback),
         raw_pdf_max_chars=int(args.raw_pdf_max_chars),
         raw_pdf_timeout_seconds=int(args.raw_pdf_timeout_seconds),
         parquet_batch_rows=int(args.parquet_batch_rows),

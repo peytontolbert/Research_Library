@@ -407,3 +407,147 @@ def test_target_total_papers_counts_existing_output_rows_only_for_output_not_com
     assert progress["covered_ids_after"] == 4
     assert progress["remaining_target_rows"] == 0
     assert progress["status"] == "completed"
+
+
+def test_distributed_coordinator_resumes_from_saved_metadata_offset(tmp_path: Path) -> None:
+    metadata_path = tmp_path / "metadata.jsonl"
+    out_dir = tmp_path / "out"
+    temp_pdf_dir = tmp_path / "tmp"
+
+    metadata_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "id": "2401.10001",
+                        "title": "Paper 1",
+                        "abstract": "Abstract 1",
+                        "authors": "Alice",
+                        "categories": "cs.AI",
+                        "license": "cc-by",
+                        "update_date": "2024-01-01",
+                        "versions": [{"version": "v1"}],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "id": "2401.10002",
+                        "title": "Paper 2",
+                        "abstract": "Abstract 2",
+                        "authors": "Bob",
+                        "categories": "cs.LG",
+                        "license": "cc-by",
+                        "update_date": "2024-01-02",
+                        "versions": [{"version": "v1"}],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "id": "2401.10003",
+                        "title": "Paper 3",
+                        "abstract": "Abstract 3",
+                        "authors": "Carol",
+                        "categories": "cs.CL",
+                        "license": "cc-by",
+                        "update_date": "2024-01-03",
+                        "versions": [{"version": "v1"}],
+                    }
+                ),
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    coordinator = DistributedBackfillCoordinator(
+        auth_token="secret",
+        existing_structured_dirs=[],
+        existing_parquet_dirs=[],
+        existing_parquet_paths=[],
+        metadata_path=str(metadata_path),
+        out_dir=str(out_dir),
+        temp_pdf_dir=str(temp_pdf_dir),
+        target_total_papers=3,
+        max_papers=0,
+        download_batch_size=1,
+        shard_size=1,
+        row_group_rows=1,
+        raw_pdf_max_chars=0,
+        raw_pdf_timeout_seconds=20,
+        parquet_compression="zstd",
+        category_prefix="",
+        min_year=0,
+        max_year=0,
+        keywords=[],
+        gcs_prefix="gs://arxiv-dataset/arxiv/pdf",
+        lease_timeout_seconds=600,
+        progress_every=0,
+        progress_path="",
+    )
+
+    lease = coordinator.lease(worker_id="worker-1", max_records=1)
+    record = lease["records"][0]
+    progress = coordinator.submit(
+        worker_id="worker-1",
+        lease_id=lease["lease_id"],
+        rows=[
+            {
+                "paper_id": record["paper_id"],
+                "canonical_paper_id": record["canonical_paper_id"],
+                "paper_version": record["paper_version"],
+                "pdf_path": record["pdf_path"],
+                "title": record["title"],
+                "abstract": record["abstract"],
+                "authors": record["authors"],
+                "categories": record["categories"],
+                "license": record["license"],
+                "update_date": record["update_date"],
+                "version_count": record["version_count"],
+                "metadata_found": True,
+                "text": f"text for {record['paper_id']}",
+                "text_source": "raw_pdf_preextracted",
+                "text_is_partial": False,
+                "text_char_count": 10,
+                "text_line_count": 1,
+                "token_count": 1,
+                "page_count": 1,
+                "token_types": ["raw_text_preextracted"],
+                "token_type_counts_json": '{"raw_text_preextracted":1}',
+            }
+        ],
+        worker_stats={},
+    )
+    assert progress["covered_ids_after"] == 1
+    assert progress["resume_metadata_offset"] > 0
+
+    resumed = DistributedBackfillCoordinator(
+        auth_token="secret",
+        existing_structured_dirs=[],
+        existing_parquet_dirs=[],
+        existing_parquet_paths=[],
+        metadata_path=str(metadata_path),
+        out_dir=str(out_dir),
+        temp_pdf_dir=str(temp_pdf_dir),
+        target_total_papers=3,
+        max_papers=0,
+        download_batch_size=1,
+        shard_size=1,
+        row_group_rows=1,
+        raw_pdf_max_chars=0,
+        raw_pdf_timeout_seconds=20,
+        parquet_compression="zstd",
+        category_prefix="",
+        min_year=0,
+        max_year=0,
+        keywords=[],
+        gcs_prefix="gs://arxiv-dataset/arxiv/pdf",
+        lease_timeout_seconds=600,
+        progress_every=0,
+        progress_path="",
+    )
+
+    assert resumed.covered_ids_before == 1
+    assert resumed.resume_metadata_offset > 0
+    resumed_lease = resumed.lease(worker_id="worker-2", max_records=1)
+    resumed_ids = {row["canonical_paper_id"] for row in resumed_lease["records"]}
+    assert resumed_ids == {"2401.10002"}

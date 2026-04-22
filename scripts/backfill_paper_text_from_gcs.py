@@ -20,15 +20,16 @@ shards can then be merged into a new deduped dataset with
 """
 
 import argparse
-import os
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from urllib.request import Request, urlopen
 
 import pyarrow as pa  # type: ignore
 import pyarrow.parquet as pq  # type: ignore
@@ -64,6 +65,9 @@ DEFAULT_PARTITION_INDEX = 0
 DEFAULT_PROGRESS_FILENAME = "gcs_backfill_progress.json"
 DEFAULT_EXTRACT_WORKERS = max(1, min(8, int(os.cpu_count() or 1)))
 DEFAULT_RETRY_MISSING_DOWNLOADS = False
+DEFAULT_DIRECT_ARXIV_PDF_FALLBACK = True
+DEFAULT_DIRECT_ARXIV_TIMEOUT_SECONDS = 60
+DIRECT_ARXIV_USER_AGENT = "repository-library-paper-backfill/1.0"
 
 
 def _split_legacy_archive_id(raw_paper_id: str) -> Optional[Tuple[str, str]]:
@@ -193,9 +197,21 @@ def _iter_metadata_candidates(
     max_year: int,
     keywords: Sequence[str],
     gcs_prefix: str,
+    start_offset: int = 0,
 ) -> Iterator[Dict[str, Any]]:
-    with metadata_path.open("r", encoding="utf-8") as fh:
-        for line in fh:
+    with metadata_path.open("rb") as fh:
+        if int(start_offset or 0) > 0:
+            fh.seek(int(start_offset))
+        while True:
+            line_start_offset = int(fh.tell())
+            raw_line = fh.readline()
+            if not raw_line:
+                break
+            line_end_offset = int(fh.tell())
+            try:
+                line = raw_line.decode("utf-8")
+            except Exception:
+                continue
             line = line.strip()
             if not line:
                 continue
@@ -234,6 +250,8 @@ def _iter_metadata_candidates(
                 "gcs_url": selected["gcs_url"],
                 "pdf_path": selected["pdf_path"],
                 "download_candidates": download_candidates,
+                "__metadata_start_offset": int(line_start_offset),
+                "__metadata_end_offset": int(line_end_offset),
                 "title": str(raw.get("title") or "").strip(),
                 "abstract": str(raw.get("abstract") or "").strip(),
                 "authors": str(raw.get("authors") or "").strip(),
@@ -308,6 +326,49 @@ def _run_gsutil_cp_one(url: str, dest_dir: Path) -> bool:
     return int(proc.returncode) == 0
 
 
+def _direct_arxiv_pdf_url(paper_id: str) -> str:
+    return f"https://arxiv.org/pdf/{str(paper_id or '').strip()}.pdf"
+
+
+def _run_direct_arxiv_pdf_download_one(
+    paper_id: str,
+    *,
+    dest_dir: Path,
+    timeout_seconds: int = DEFAULT_DIRECT_ARXIV_TIMEOUT_SECONDS,
+) -> bool:
+    normalized_paper_id = str(paper_id or "").strip()
+    if not normalized_paper_id:
+        return False
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / f"{Path(normalized_paper_id).name}.pdf"
+    request = Request(
+        _direct_arxiv_pdf_url(normalized_paper_id),
+        headers={
+            "User-Agent": DIRECT_ARXIV_USER_AGENT,
+            "Accept": "application/pdf",
+        },
+    )
+    try:
+        with urlopen(request, timeout=int(timeout_seconds)) as resp:
+            content_type = str(resp.headers.get("Content-Type") or "").lower()
+            if "pdf" not in content_type and "application/octet-stream" not in content_type:
+                return False
+            with dest_path.open("wb") as fh:
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+    except Exception:
+        try:
+            if dest_path.exists():
+                dest_path.unlink()
+        except Exception:
+            pass
+        return False
+    return dest_path.is_file() and dest_path.stat().st_size > 0
+
+
 def _find_downloaded_pdf(batch_dir: Path, canonical_paper_id: str) -> Optional[Path]:
     filename_stem = Path(str(canonical_paper_id or "").strip()).name
     exact = sorted(batch_dir.rglob(f"{filename_stem}.pdf"))
@@ -322,7 +383,8 @@ def _resolve_download_candidate(
     *,
     batch_dir: Path,
     retry_missing_downloads: bool,
-) -> Tuple[Optional[Dict[str, Any]], Optional[Path], bool]:
+    direct_arxiv_pdf_fallback: bool,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Path], bool, bool]:
     candidates_any = record.get("download_candidates") or []
     candidates: List[Dict[str, str]] = [
         dict(candidate)
@@ -344,7 +406,7 @@ def _resolve_download_candidate(
         if pdf_path is not None:
             resolved = dict(record)
             resolved.update(candidate)
-            return resolved, pdf_path, idx > 0
+            return resolved, pdf_path, idx > 0, False
 
     if retry_missing_downloads:
         for idx, candidate in enumerate(candidates):
@@ -356,8 +418,21 @@ def _resolve_download_candidate(
                 if pdf_path is not None:
                     resolved = dict(record)
                     resolved.update(candidate)
-                    return resolved, pdf_path, idx > 0
-    return None, None, False
+                    return resolved, pdf_path, idx > 0, False
+    if direct_arxiv_pdf_fallback:
+        for idx, candidate in enumerate(candidates):
+            paper_id = str(candidate.get("paper_id") or "").strip()
+            if not paper_id:
+                continue
+            if _run_direct_arxiv_pdf_download_one(paper_id, dest_dir=batch_dir):
+                pdf_path = _find_downloaded_pdf(batch_dir, paper_id)
+                if pdf_path is None:
+                    continue
+                resolved = dict(record)
+                resolved.update(candidate)
+                resolved["pdf_path"] = _direct_arxiv_pdf_url(paper_id)
+                return resolved, pdf_path, idx > 0, True
+    return None, None, False, False
 
 
 def _token_type_counts_json(line_count: int) -> str:
@@ -452,6 +527,7 @@ def backfill_paper_text_from_gcs(
     delete_temp_pdfs: bool = True,
     extract_workers: int = DEFAULT_EXTRACT_WORKERS,
     retry_missing_downloads: bool = DEFAULT_RETRY_MISSING_DOWNLOADS,
+    direct_arxiv_pdf_fallback: bool = DEFAULT_DIRECT_ARXIV_PDF_FALLBACK,
     partition_count: int = DEFAULT_PARTITION_COUNT,
     partition_index: int = DEFAULT_PARTITION_INDEX,
     progress_path: Optional[str] = None,
@@ -540,6 +616,7 @@ def backfill_paper_text_from_gcs(
     deleted_temp_pdfs = 0
     extracted = 0
     version_fallback_uses = 0
+    direct_pdf_fallback_uses = 0
     started_at = time.time()
 
     def snapshot(*, status: str) -> Dict[str, Any]:
@@ -585,6 +662,7 @@ def backfill_paper_text_from_gcs(
             "partition_count": int(partition_count),
             "partition_index": int(partition_index),
             "version_fallback_uses": int(version_fallback_uses),
+            "direct_pdf_fallback_uses": int(direct_pdf_fallback_uses),
             "open_shard_rows_buffered": int(len(rows)),
             "open_shard_rows_written": int(active_shard_rows),
             "open_temp_pdfs": int(sum(1 for _ in temp_pdf_dir_path.rglob("*.pdf"))),
@@ -633,7 +711,7 @@ def backfill_paper_text_from_gcs(
     def process_batch(batch_records: List[Dict[str, Any]], batch_idx: int) -> None:
         nonlocal skipped_empty, missing_downloads, download_batches, download_requested
         nonlocal downloaded_pdfs, deleted_temp_pdfs, extracted
-        nonlocal version_fallback_uses
+        nonlocal version_fallback_uses, direct_pdf_fallback_uses
 
         if not batch_records:
             return
@@ -654,16 +732,19 @@ def backfill_paper_text_from_gcs(
         try:
             resolved_records: List[Tuple[Dict[str, Any], Path]] = []
             for record in batch_records:
-                resolved_record, pdf_path, used_fallback = _resolve_download_candidate(
+                resolved_record, pdf_path, used_fallback, used_direct_pdf_fallback = _resolve_download_candidate(
                     record,
                     batch_dir=batch_dir,
                     retry_missing_downloads=bool(retry_missing_downloads),
+                    direct_arxiv_pdf_fallback=bool(direct_arxiv_pdf_fallback),
                 )
                 if resolved_record is None or pdf_path is None:
                     missing_downloads += 1
                     continue
                 if used_fallback:
                     version_fallback_uses += 1
+                if used_direct_pdf_fallback:
+                    direct_pdf_fallback_uses += 1
                 resolved_records.append((resolved_record, pdf_path))
 
             if extract_workers <= 1 or len(resolved_records) <= 1:
@@ -878,6 +959,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--disable-direct-arxiv-pdf-fallback",
+        action="store_true",
+        help=(
+            "Disable direct https://arxiv.org/pdf fallback for objects missing from the "
+            "GCS mirror."
+        ),
+    )
+    parser.add_argument(
         "--target-total-papers",
         type=int,
         default=0,
@@ -942,6 +1031,7 @@ def main() -> None:
         download_batch_size=int(args.download_batch_size),
         extract_workers=int(args.extract_workers or DEFAULT_EXTRACT_WORKERS),
         retry_missing_downloads=bool(args.retry_missing_downloads),
+        direct_arxiv_pdf_fallback=not bool(args.disable_direct_arxiv_pdf_fallback),
         category_prefix=str(args.category_prefix or DEFAULT_CATEGORY_PREFIX),
         min_year=int(args.min_year or 0),
         max_year=int(args.max_year or 0),

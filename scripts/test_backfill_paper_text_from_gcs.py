@@ -366,3 +366,72 @@ def test_backfill_paper_text_from_gcs_supports_legacy_slash_style_ids(
     assert row["paper_id"] == "acc-phys/9411001v1"
     assert row["paper_version"] == "v1"
     assert row["pdf_path"] == "gs://arxiv-dataset/arxiv/acc-phys/pdf/9411/9411001v1.pdf"
+
+
+def test_backfill_paper_text_from_gcs_uses_direct_arxiv_pdf_fallback(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    metadata_path = tmp_path / "metadata.jsonl"
+    out_dir = tmp_path / "out"
+    temp_pdf_dir = tmp_path / "tmp_pdfs"
+
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "id": "2511.09594",
+                "title": "Direct PDF Fallback",
+                "abstract": "Needs arxiv.org/pdf fallback",
+                "authors": "Alice",
+                "categories": "cs.AI",
+                "license": "cc-by",
+                "update_date": "2025-11-14",
+                "versions": [{"version": "v1"}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def fake_gsutil(urls, dest_dir):
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        return 0
+
+    def fake_direct_download(paper_id: str, *, dest_dir: Path, timeout_seconds: int = 60) -> bool:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        (dest_dir / f"{Path(paper_id).name}.pdf").write_bytes(b"%PDF-1.4 direct\n")
+        return True
+
+    def fake_extract_pdf_text(path: Path, *, max_chars: int, timeout_seconds: int) -> str:
+        return f"full text for {path.stem}"
+
+    monkeypatch.setattr("scripts.backfill_paper_text_from_gcs._run_gsutil_cp", fake_gsutil)
+    monkeypatch.setattr(
+        "scripts.backfill_paper_text_from_gcs._run_direct_arxiv_pdf_download_one",
+        fake_direct_download,
+    )
+    monkeypatch.setattr(
+        "scripts.backfill_paper_text_from_gcs._extract_pdf_text_fast",
+        fake_extract_pdf_text,
+    )
+
+    result = backfill_paper_text_from_gcs(
+        existing_structured_dirs=[],
+        existing_parquet_dirs=[],
+        existing_parquet_paths=[],
+        metadata_path=str(metadata_path),
+        out_dir=str(out_dir),
+        temp_pdf_dir=str(temp_pdf_dir),
+        progress_every=0,
+    )
+
+    stats = result["stats"]
+    assert stats["extracted_rows"] == 1
+    assert stats["direct_pdf_fallback_uses"] == 1
+
+    shard_paths = sorted(out_dir.glob("paper_text_backfill_*.parquet"))
+    assert len(shard_paths) == 1
+    row = pq.read_table(str(shard_paths[0])).to_pylist()[0]
+    assert row["canonical_paper_id"] == "2511.09594"
+    assert row["paper_id"] == "2511.09594v1"
+    assert row["pdf_path"] == "https://arxiv.org/pdf/2511.09594v1.pdf"

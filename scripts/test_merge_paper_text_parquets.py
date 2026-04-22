@@ -169,3 +169,107 @@ def test_merge_paper_text_parquets_dedupes_and_fills_metadata(tmp_path: Path) ->
     assert row2["title"] == "Metadata Title 2"
     assert row2["authors"] == "Carol"
     assert row2["metadata_found"] is True
+
+
+def test_merge_paper_text_parquets_supports_exact_target_rows(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.parquet"
+    backfill_path = tmp_path / "backfill.parquet"
+    output_dir = tmp_path / "merged"
+    metadata_path = tmp_path / "metadata.jsonl"
+
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "paper_id": "2401.00001v2",
+                    "canonical_paper_id": "2401.00001",
+                    "paper_version": "v2",
+                    "pdf_path": "/arxiv/pdfs/2401/2401.00001v2.pdf",
+                    "title": "Base title",
+                    "abstract": "Base abstract",
+                    "authors": "Alice",
+                    "categories": "cs.AI",
+                    "license": "",
+                    "update_date": "",
+                    "version_count": 2,
+                    "metadata_found": True,
+                    "text": "base text",
+                    "text_source": "raw_pdf_preferred",
+                    "text_is_partial": False,
+                    "text_char_count": 9,
+                    "text_line_count": 1,
+                    "token_count": 1,
+                    "page_count": 5,
+                    "token_types": ["raw_text_pdf"],
+                    "token_type_counts_json": "{\"raw_text_pdf\":1}",
+                },
+            ]
+        ),
+        str(base_path),
+        compression="zstd",
+    )
+
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "paper_id": "2401.00002v1",
+                    "canonical_paper_id": "2401.00002",
+                    "paper_version": "v1",
+                    "pdf_path": "/arxiv/pdfs/2401/2401.00002v1.pdf",
+                    "title": "Backfill title",
+                    "abstract": "Backfill abstract",
+                    "authors": "Bob",
+                    "categories": "cs.LG",
+                    "license": "",
+                    "update_date": "",
+                    "version_count": 1,
+                    "metadata_found": True,
+                    "text": "backfill text",
+                    "text_source": "raw_pdf_preextracted",
+                    "text_is_partial": False,
+                    "text_char_count": 13,
+                    "text_line_count": 1,
+                    "token_count": 1,
+                    "page_count": 6,
+                    "token_types": ["raw_text_preextracted"],
+                    "token_type_counts_json": "{\"raw_text_preextracted\":1}",
+                }
+            ]
+        ),
+        str(backfill_path),
+        compression="zstd",
+    )
+
+    metadata_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"id": "2401.00001", "title": "Metadata Title 1", "versions": [{"version": "v1"}, {"version": "v2"}]}),
+                json.dumps({"id": "2401.00002", "title": "Metadata Title 2", "versions": [{"version": "v1"}]}),
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = merge_paper_text_parquets(
+        base_parquets=[str(base_path)],
+        backfill_parquets=[str(backfill_path)],
+        metadata_path=str(metadata_path),
+        output_dir=str(output_dir),
+        rows_per_output_file=10,
+        compression="zstd",
+        target_rows=1,
+    )
+
+    stats = result["stats"]
+    assert stats["merged_rows"] == 1
+    assert stats["target_rows"] == 1
+    assert stats["merged_rows_before_target_cap"] == 2
+
+    rows = []
+    for shard_path in sorted(output_dir.glob("train_*.parquet")):
+        rows.extend(pq.read_table(str(shard_path)).to_pylist())
+
+    assert len(rows) == 1
+    assert rows[0]["canonical_paper_id"] == "2401.00001"
