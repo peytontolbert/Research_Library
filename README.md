@@ -73,9 +73,9 @@ Current public snapshot:
 - That includes `178` repo rows, `906,024` entities, `8,402,561` per-repo edges, `453,278` artifacts, `216,987` universe nodes, `5,518,898` universe edges, and `1,350` repo-to-repo KNN edges.
 - In practical terms, it is a large machine-readable map of the code library rather than a source-code dump.
 
-#### `PeytonT/100k_papers_text`
+#### `PeytonT/1m_papers_text`
 
-Dataset: [huggingface.co/datasets/PeytonT/100k_papers_text](https://huggingface.co/datasets/PeytonT/100k_papers_text)
+Dataset: [huggingface.co/datasets/PeytonT/1m_papers_text](https://huggingface.co/datasets/PeytonT/1m_papers_text)
 
 Relevant scripts:
 
@@ -84,6 +84,7 @@ Relevant scripts:
 - `scripts/backfill_paper_text_from_gcs.py` grows the corpus by temporarily downloading missing PDFs from GCS and writing parquet backfill shards.
 - `scripts/distributed_paper_text_backfill.py` coordinates that same backfill workflow across multiple workers.
 - `scripts/merge_paper_text_parquets.py` merges base exports plus backfills and dedupes on `canonical_paper_id`.
+- Operator guide: [docs/paper_text_backfill_cluster.md](docs/paper_text_backfill_cluster.md)
 
 What the dataset is:
 
@@ -94,10 +95,8 @@ What the dataset is:
 
 Current public snapshot:
 
-- As published on April 19, 2026, the public dataset contains `100,569` papers, all with matched arXiv metadata.
-- `100,549` rows came from preferred raw-PDF extraction, `17` rows came from the structured-token export, and `3` rows came from raw-PDF fallback extraction.
+- As published on April 19, 2026, the public dataset contains `1,000,000` papers, all with matched arXiv metadata.
 - The export was generated with `--prefer-raw-pdf-text` and `--raw-pdf-max-chars 0`, which means the PDF-sourced rows are intended to be full-document extracts rather than capped snippets.
-- License metadata matters here: `60,005` rows use arXiv's `nonexclusive-distrib` license, while many others use Creative Commons licenses such as CC BY 4.0.
 - In practical terms, this dataset is a public text corpus for paper-scale retrieval, search, and training workflows, with enough metadata to filter by license and provenance before reuse.
 
 ### SkillSets (Per-Repository Skills)
