@@ -76,6 +76,29 @@ class GraphModel(ContrastiveModel):
         """Edges are dicts with 'src' and 'dst' textual descriptions."""
         if not edges:
             return []
+        if self._ensure_ready() and torch is not None and hasattr(self.backbone, "forward"):
+            max_len = self.config.get("dataset", {}).get("tokenization", {}).get("max_source_tokens", 256)
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.backbone.to(device)
+            self.backbone.eval()
+            prompts = [f"QUERY:\n{e.get('src', '')}\nDOC:\n{e.get('dst', '')}" for e in edges]
+            scores: List[float] = []
+            with torch.no_grad():
+                for chunk_start in range(0, len(prompts), 8):
+                    chunk = prompts[chunk_start : chunk_start + 8]
+                    enc = self.tokenizer(chunk, padding=True, truncation=True, max_length=max_len, return_tensors="pt")
+                    enc = {k: v.to(device) for k, v in enc.items()}
+                    out = self.backbone(**enc)
+                    logits = getattr(out, "logits", None)
+                    if logits is None or logits.ndim != 2:
+                        break
+                    if logits.shape[-1] == 1:
+                        probs = torch.sigmoid(logits[:, 0])
+                    else:
+                        probs = torch.softmax(logits, dim=-1)[:, -1]
+                    scores.extend(probs.detach().cpu().tolist())
+            if len(scores) == len(edges):
+                return scores
         pairs = [{"text_a": e.get("src", ""), "text_b": e.get("dst", "")} for e in edges]
         return self.score_pairs(pairs)
 

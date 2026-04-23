@@ -84,7 +84,9 @@ Relevant scripts:
 - `scripts/backfill_paper_text_from_gcs.py` grows the corpus by temporarily downloading missing PDFs from GCS and writing parquet backfill shards.
 - `scripts/distributed_paper_text_backfill.py` coordinates that same backfill workflow across multiple workers.
 - `scripts/merge_paper_text_parquets.py` merges base exports plus backfills and dedupes on `canonical_paper_id`.
+- `scripts/paper_universe_build.py` builds a standalone parquet-backed paper universe graph from the paper-text dataset without duplicating full paper text, including optional paper KNN, category similarity, and year anchor layers.
 - Operator guide: [docs/paper_text_backfill_cluster.md](docs/paper_text_backfill_cluster.md)
+- Paper universe notes: [docs/paper_universe.md](docs/paper_universe.md)
 
 What the dataset is:
 

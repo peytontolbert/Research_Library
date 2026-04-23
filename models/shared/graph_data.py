@@ -21,9 +21,15 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Any
 from collections import defaultdict
 
+try:
+    import pyarrow.parquet as pq
+except Exception:  # pragma: no cover - optional dependency
+    pq = None
+
 EXPORT_ROOT = Path("/data/repository_library/exports")
 MANIFEST_PATH = EXPORT_ROOT / "_manifest.json"
 ARXIV_METADATA_PATH = Path("/data/arxiv/arxiv-metadata-oai-snapshot.json")
+PAPER_UNIVERSE_DIR = EXPORT_ROOT / "_paper_universe"
 
 
 @dataclass
@@ -245,6 +251,17 @@ class PaperRecord:
     categories: str
 
 
+def _paper_primary_category(raw: Any) -> str:
+    if isinstance(raw, (list, tuple)):
+        for item in raw:
+            text = str(item or "").strip()
+            if text:
+                return text
+        return ""
+    text = str(raw or "").strip()
+    return text.split()[0] if text else ""
+
+
 def _iter_arxiv_metadata(limit: int = 0) -> Iterable[PaperRecord]:
     if not ARXIV_METADATA_PATH.exists():
         return []
@@ -274,7 +291,158 @@ def _iter_arxiv_metadata(limit: int = 0) -> Iterable[PaperRecord]:
             count += 1
 
 
-def load_paper_graph_samples(max_samples: int = 1024) -> List[GraphSample]:
+def _load_paper_graph_samples_from_universe(
+    *,
+    max_samples: int,
+    universe_dir: Path,
+) -> List[GraphSample]:
+    if pq is None:
+        return []
+    nodes_path = universe_dir / "paper_nodes.parquet"
+    edges_path = universe_dir / "paper_knn_edges.parquet"
+    if not nodes_path.exists() or not edges_path.exists():
+        return []
+
+    try:
+        nodes_pf = pq.ParquetFile(nodes_path)
+        edges_pf = pq.ParquetFile(edges_path)
+    except Exception:
+        return []
+
+    node_columns = [
+        "paper_idx",
+        "paper_id",
+        "canonical_paper_id",
+        "title",
+        "authors",
+        "primary_category",
+        "categories",
+        "pdf_path",
+    ]
+    edge_columns = ["src_paper_idx", "dst_paper_idx", "type", "weight"]
+    node_fields = set(nodes_pf.schema.names)
+    edge_fields = set(edges_pf.schema.names)
+    available_node_columns = [col for col in node_columns if col in node_fields]
+    available_edge_columns = [col for col in edge_columns if col in edge_fields]
+    if "paper_idx" not in available_node_columns or "src_paper_idx" not in available_edge_columns or "dst_paper_idx" not in available_edge_columns:
+        return []
+
+    positive_budget = max(1, max_samples // 2) if max_samples else 0
+    if positive_budget <= 0:
+        return []
+
+    positive_edges: List[Dict[str, Any]] = []
+    needed_node_ids: set[int] = set()
+    for batch in edges_pf.iter_batches(columns=available_edge_columns, batch_size=2048):
+        for row in batch.to_pylist():
+            if not isinstance(row, dict):
+                continue
+            src_idx = row.get("src_paper_idx")
+            dst_idx = row.get("dst_paper_idx")
+            if src_idx is None or dst_idx is None or src_idx == dst_idx:
+                continue
+            edge = {
+                "src_paper_idx": int(src_idx),
+                "dst_paper_idx": int(dst_idx),
+                "type": str(row.get("type") or "paper_knn"),
+                "weight": float(row.get("weight") or 0.0),
+            }
+            positive_edges.append(edge)
+            needed_node_ids.add(edge["src_paper_idx"])
+            needed_node_ids.add(edge["dst_paper_idx"])
+            if len(positive_edges) >= positive_budget:
+                break
+        if len(positive_edges) >= positive_budget:
+            break
+    if not positive_edges:
+        return []
+
+    nodes: Dict[int, Dict[str, str]] = {}
+    for batch in nodes_pf.iter_batches(columns=available_node_columns, batch_size=4096):
+        for row in batch.to_pylist():
+            if not isinstance(row, dict):
+                continue
+            paper_idx = row.get("paper_idx")
+            if paper_idx is None:
+                continue
+            paper_idx = int(paper_idx)
+            if paper_idx not in needed_node_ids:
+                continue
+            category = _paper_primary_category(row.get("primary_category") or row.get("categories")) or "paper"
+            paper_id = str(row.get("canonical_paper_id") or row.get("paper_id") or paper_idx)
+            title = str(row.get("title") or paper_id).strip()
+            nodes[paper_idx] = {
+                "id": paper_id,
+                "kind": category,
+                "name": title[:200],
+                "uri": str(row.get("pdf_path") or f"paper://{paper_idx}"),
+            }
+        if len(nodes) >= len(needed_node_ids):
+            break
+    if not nodes:
+        return []
+
+    samples: List[GraphSample] = []
+    edge_set: set[Tuple[int, int]] = set()
+    node_ids = sorted(nodes.keys())
+    random.seed(42)
+
+    for edge in positive_edges:
+        src_idx = edge["src_paper_idx"]
+        dst_idx = edge["dst_paper_idx"]
+        src = nodes.get(src_idx)
+        dst = nodes.get(dst_idx)
+        if not src or not dst:
+            continue
+        edge_set.add((src_idx, dst_idx))
+        edge_set.add((dst_idx, src_idx))
+        samples.append(
+            GraphSample(
+                repo_id="paper_universe",
+                src=src,
+                dst=dst,
+                label=1,
+                edge_type=edge["type"],
+                repo_meta={"weight": edge["weight"], "src_paper_idx": src_idx, "dst_paper_idx": dst_idx},
+                subgraph=None,
+                domain="paper",
+            )
+        )
+        if len(samples) >= max_samples:
+            return samples[:max_samples]
+
+    attempts = 0
+    while len(samples) < max_samples and len(node_ids) >= 2 and attempts < max_samples * 20:
+        attempts += 1
+        src_idx, dst_idx = random.sample(node_ids, 2)
+        if (src_idx, dst_idx) in edge_set:
+            continue
+        src = nodes.get(src_idx)
+        dst = nodes.get(dst_idx)
+        if not src or not dst:
+            continue
+        if src.get("kind") == dst.get("kind") and attempts < max_samples * 10:
+            continue
+        edge_set.add((src_idx, dst_idx))
+        edge_set.add((dst_idx, src_idx))
+        samples.append(
+            GraphSample(
+                repo_id="paper_universe",
+                src=src,
+                dst=dst,
+                label=0,
+                edge_type="paper_knn_negative",
+                repo_meta={"src_paper_idx": src_idx, "dst_paper_idx": dst_idx},
+                subgraph=None,
+                domain="paper",
+            )
+        )
+
+    random.shuffle(samples)
+    return samples[:max_samples]
+
+
+def _load_paper_graph_samples_from_metadata(max_samples: int = 1024) -> List[GraphSample]:
     """
     Build paper-level graph-like samples using ArXiv metadata.
 
@@ -382,6 +550,25 @@ def load_paper_graph_samples(max_samples: int = 1024) -> List[GraphSample]:
     return samples[:max_samples]
 
 
+def load_paper_graph_samples(
+    max_samples: int = 1024,
+    *,
+    universe_dir: Path | str = PAPER_UNIVERSE_DIR,
+    prefer_universe: bool = True,
+) -> List[GraphSample]:
+    universe_dir = Path(universe_dir)
+    if prefer_universe and universe_dir.exists():
+        universe_samples = _load_paper_graph_samples_from_universe(max_samples=max_samples, universe_dir=universe_dir)
+        if universe_samples:
+            return universe_samples
+    metadata_samples = _load_paper_graph_samples_from_metadata(max_samples=max_samples)
+    if metadata_samples:
+        return metadata_samples
+    if universe_dir.exists():
+        return _load_paper_graph_samples_from_universe(max_samples=max_samples, universe_dir=universe_dir)
+    return []
+
+
 def paper_sample_to_text(sample: GraphSample) -> Dict[str, str]:
     """Render a paper GraphSample into textual fields for the HF tokenizer."""
     def fmt(node: Dict[str, str]) -> str:
@@ -390,7 +577,16 @@ def paper_sample_to_text(sample: GraphSample) -> Dict[str, str]:
     text_a = fmt(sample.src)
     text_b = fmt(sample.dst)
     edge_info = f"edge={sample.edge_type}" if sample.edge_type else "edge=unknown"
-    text = f"PAPER GRAPH\nSRC: {text_a}\nDST: {text_b}\n{edge_info}"
+    meta_bits: List[str] = []
+    if sample.repo_meta:
+        weight = sample.repo_meta.get("weight")
+        if weight is not None:
+            try:
+                meta_bits.append(f"weight={float(weight):.4f}")
+            except Exception:
+                pass
+    meta_text = f"\nMETA: {' '.join(meta_bits)}" if meta_bits else ""
+    text = f"PAPER GRAPH\nSRC: {text_a}\nDST: {text_b}\n{edge_info}{meta_text}"
     return {
         "text_a": text_a,
         "text_b": text_b,

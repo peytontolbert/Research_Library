@@ -53,6 +53,20 @@ Target: edges to similar papers
 Input: author ID
 Target: embedding representing scientific field / community
 
+Supplementary Paper Embedding Experiments
+
+M6. Paper Full-Text Embedding Model
+
+Input: title + abstract query paired with full-paper documents and body chunks
+Target: embedding aligned for document/chunk retrieval
+(contrastive objective with optional distillation from paper-universe full-text embeddings)
+
+M7. Paper Sentence Embedding Model
+
+Input: abstract/title sentences paired with matched paper-body sentences
+Target: sentence-level embedding for fine-grained retrieval and QA grounding
+(contrastive objective with optional paper-level teacher distillation)
+
 ─────────────────────────────────────────────
 TIER 2 — ABSTRACT-LEVEL MODELS (FAST, HIGH-LEVEL SEMANTICS)
 6. Abstract → Code-Relevance Classifier

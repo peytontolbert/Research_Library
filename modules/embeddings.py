@@ -21,7 +21,7 @@ used both by:
 """
 
 import os
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 try:  # Optional heavy deps; callers get a clear error if missing.
     import torch  # type: ignore
@@ -38,9 +38,19 @@ from .model_registry import get_model_config  # type: ignore
 
 _EMBED_MODEL = None
 _EMBED_TOKENIZER = None
+_EMBED_MODEL_DEVICE: Optional[str] = None
 
 
-def _load_embed_model():
+def _resolve_embed_device(explicit_device: str | None = None) -> str:
+    device = str(explicit_device or os.environ.get("EMBED_DEVICE") or "").strip()
+    if device:
+        return device
+    if torch is not None and torch.cuda.is_available():  # pragma: no cover - runtime env
+        return "cuda"
+    return "cpu"
+
+
+def _load_embed_model(*, device: str | None = None):
     """
     Load (and cache) the embedding model.
 
@@ -50,9 +60,14 @@ def _load_embed_model():
         EMBED_MODEL_PATH (env) or
         "sentence-transformers/all-MiniLM-L6-v2"
     """
-    global _EMBED_MODEL, _EMBED_TOKENIZER
+    global _EMBED_MODEL, _EMBED_TOKENIZER, _EMBED_MODEL_DEVICE
+
+    resolved_device = _resolve_embed_device(device)
 
     if _EMBED_MODEL is not None and _EMBED_TOKENIZER is not None:
+        if _EMBED_MODEL_DEVICE != resolved_device:
+            _EMBED_MODEL = _EMBED_MODEL.to(resolved_device)  # type: ignore[assignment]
+            _EMBED_MODEL_DEVICE = resolved_device
         return _EMBED_MODEL, _EMBED_TOKENIZER
 
     if AutoModel is None or AutoTokenizer is None:
@@ -86,16 +101,21 @@ def _load_embed_model():
         model_kwargs["cache_dir"] = cache_dir
     model = AutoModel.from_pretrained(model_id, **model_kwargs)
 
-    if torch is not None and torch.cuda.is_available():  # pragma: no cover - runtime env
-        model = model.to("cuda")  # type: ignore[assignment]
+    model = model.to(resolved_device)  # type: ignore[assignment]
 
     model.eval()
     _EMBED_MODEL = model
     _EMBED_TOKENIZER = tokenizer
+    _EMBED_MODEL_DEVICE = resolved_device
     return _EMBED_MODEL, _EMBED_TOKENIZER
 
 
-def embed_texts(texts: Iterable[str], batch_size: int | None = None) -> np.ndarray:
+def embed_texts(
+    texts: Iterable[str],
+    batch_size: int | None = None,
+    *,
+    device: str | None = None,
+) -> np.ndarray:
     """
     Compute vector embeddings for a sequence of texts.
 
@@ -106,7 +126,8 @@ def embed_texts(texts: Iterable[str], batch_size: int | None = None) -> np.ndarr
     if not texts_list:
         return np.zeros((0, 0), dtype="float32")
 
-    model, tokenizer = _load_embed_model()
+    resolved_device = _resolve_embed_device(device)
+    model, tokenizer = _load_embed_model(device=resolved_device)
     if torch is None:
         raise RuntimeError("torch is not available; cannot run embedding inference.")
 
@@ -123,9 +144,8 @@ def embed_texts(texts: Iterable[str], batch_size: int | None = None) -> np.ndarr
                 max_length=512,
                 return_tensors="pt",
             )
-            if torch.cuda.is_available():  # pragma: no cover - runtime env
-                inputs = {k: v.to("cuda") for k, v in inputs.items()}  # type: ignore[assignment]
-                model = model.to("cuda")  # type: ignore[assignment]
+            inputs = {k: v.to(resolved_device) for k, v in inputs.items()}  # type: ignore[assignment]
+            model = model.to(resolved_device)  # type: ignore[assignment]
 
             outputs = model(**inputs)
             # Mean-pool last_hidden_state using the attention mask.

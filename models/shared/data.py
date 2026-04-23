@@ -2,11 +2,13 @@
 Dataset scaffolding for the 32-model substrate.
 Supports lightweight sampling from:
 - arXiv metadata (/data/arxiv/arxiv-metadata-oai-snapshot.json)
+- parquet-backed paper text datasets (/arxiv/huggingface/paper_text_1m_dedup_v1)
 - PDFs (/arxiv/pdfs/{year}/) or structured shards under exports/pdfs_structured/
 - repositories (/data/repositories)
 Falls back to placeholders if sources are missing.
 """
 
+from collections import Counter
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Iterable, Iterator
 import json
@@ -16,6 +18,11 @@ import re
 import gzip
 import itertools
 import hashlib
+
+try:
+    import pyarrow.parquet as pq
+except Exception:  # pragma: no cover - optional dependency
+    pq = None
 
 from models.shared.archetypes import get_archetype
 from models.shared.graph_data import (
@@ -29,6 +36,8 @@ from models.shared.pdf_utils import extract_pdf_text
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PDF_SEARCH_ROOTS = [REPO_ROOT / "exports/arxiv_pdfs", Path("/arxiv/pdfs")]
+DEFAULT_PAPER_DATASET_DIR = Path("/arxiv/huggingface/paper_text_1m_dedup_v1")
+DEFAULT_PAPER_UNIVERSE_DIR = REPO_ROOT / "exports/_paper_universe"
 
 
 def _candidate_data_paths(path_like: Path | str) -> List[Path]:
@@ -141,6 +150,113 @@ def _sample_metadata(manifest: Dict[str, Any], max_samples: int, filters: Dict[s
         entries = [e for e in entries if _has_cat(e)]
     random.shuffle(entries)
     return entries[:max_samples]
+
+
+def _paper_parquet_paths(dataset_dir: Path | str) -> List[Path]:
+    dataset_dir = _resolve_data_dir(dataset_dir, "*.parquet")
+    if dataset_dir.is_file():
+        return [dataset_dir]
+    paths = sorted(dataset_dir.glob("train_*.parquet"))
+    if not paths:
+        paths = sorted(dataset_dir.glob("*.parquet"))
+    return [p for p in paths if p.is_file()]
+
+
+def _paper_row_year(row: Dict[str, Any]) -> int | None:
+    year = row.get("year")
+    try:
+        if year is not None:
+            return int(year)
+    except Exception:
+        pass
+    update_date = str(row.get("update_date") or "").strip()
+    if len(update_date) >= 4 and update_date[:4].isdigit():
+        return int(update_date[:4])
+    paper_id = str(row.get("canonical_paper_id") or row.get("paper_id") or "").strip()
+    if len(paper_id) >= 4 and paper_id[:4].isdigit():
+        return 2000 + int(paper_id[:2])
+    return None
+
+
+def _normalize_paper_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(row)
+    categories = row.get("categories") or row.get("primary_category") or ""
+    if isinstance(categories, (list, tuple)):
+        categories_text = " ".join(str(item or "").strip() for item in categories if str(item or "").strip())
+    else:
+        categories_text = str(categories or "").strip()
+    authors = row.get("authors") or ""
+    if isinstance(authors, (list, tuple)):
+        authors_text = ", ".join(str(item or "").strip() for item in authors if str(item or "").strip())
+    else:
+        authors_text = str(authors or "").strip()
+    normalized["title"] = str(row.get("title") or "").strip()
+    normalized["abstract"] = str(row.get("abstract") or "").strip()
+    normalized["text"] = str(row.get("text") or "").strip()
+    normalized["authors"] = authors_text
+    normalized["categories"] = categories_text
+    if not normalized.get("primary_category") and categories_text:
+        normalized["primary_category"] = categories_text.split()[0]
+    return normalized
+
+
+def _sample_paper_text_parquet(
+    max_samples: int,
+    filters: Dict[str, Any],
+    dataset_dir: Path | str = DEFAULT_PAPER_DATASET_DIR,
+) -> List[Dict[str, Any]]:
+    if pq is None:
+        return []
+    paths = _paper_parquet_paths(dataset_dir)
+    if not paths:
+        return []
+    years_filter = filters.get("years")
+    categories_filter = set(filters.get("categories") or [])
+    requested_columns = [
+        "paper_id",
+        "canonical_paper_id",
+        "paper_version",
+        "pdf_path",
+        "title",
+        "abstract",
+        "authors",
+        "categories",
+        "primary_category",
+        "license",
+        "update_date",
+        "year",
+        "metadata_found",
+        "text",
+        "text_source",
+        "text_is_partial",
+        "text_char_count",
+        "token_count",
+        "page_count",
+    ]
+    rows: List[Dict[str, Any]] = []
+    for path in paths:
+        try:
+            parquet_file = pq.ParquetFile(path)
+        except Exception:
+            continue
+        available_columns = [col for col in requested_columns if col in parquet_file.schema.names]
+        for batch in parquet_file.iter_batches(columns=available_columns, batch_size=1024):
+            for row in batch.to_pylist():
+                if not isinstance(row, dict):
+                    continue
+                normalized = _normalize_paper_row(row)
+                if years_filter and len(years_filter) == 2:
+                    year = _paper_row_year(normalized)
+                    if year is not None and not (int(years_filter[0]) <= year <= int(years_filter[1])):
+                        continue
+                if categories_filter:
+                    categories = normalized.get("categories") or normalized.get("primary_category") or ""
+                    if not any(cat in str(categories) for cat in categories_filter):
+                        continue
+                rows.append(normalized)
+                if len(rows) >= max_samples:
+                    return rows
+    return rows[:max_samples]
 
 
 def _iter_pdf_paths(filters: Dict[str, Any]) -> Iterable[str]:
@@ -489,6 +605,695 @@ def _format_text_from_entry(entry: Dict[str, Any]) -> str:
     return "\n".join([title, abstract, categories, authors])
 
 
+def _entry_paper_id(entry: Dict[str, Any]) -> str:
+    return str(
+        entry.get("canonical_paper_id")
+        or entry.get("paper_id")
+        or entry.get("id")
+        or entry.get("entry_id")
+        or ""
+    ).strip()
+
+
+def _compose_full_paper_text(entry: Dict[str, Any]) -> str:
+    title = str(entry.get("title") or "").strip()
+    abstract = str(entry.get("abstract") or "").strip()
+    body = str(entry.get("text") or "").strip()
+    parts = []
+    if title:
+        parts.append(f"Title: {title}")
+    if abstract:
+        parts.append(f"Abstract: {abstract}")
+    if body:
+        parts.append(body)
+    return "\n\n".join(parts).strip() or _format_text_from_entry(entry)
+
+
+_KEYWORD_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_./+-]{2,}")
+_KEYWORD_STOPWORDS = {
+    "abstract",
+    "analysis",
+    "approach",
+    "based",
+    "between",
+    "data",
+    "demonstrate",
+    "evaluate",
+    "experiments",
+    "figure",
+    "framework",
+    "improve",
+    "method",
+    "methods",
+    "model",
+    "models",
+    "paper",
+    "present",
+    "problem",
+    "propose",
+    "results",
+    "section",
+    "show",
+    "study",
+    "system",
+    "table",
+    "task",
+    "tasks",
+    "technique",
+    "using",
+    "approaches",
+}
+
+
+def _paper_body_text(entry: Dict[str, Any]) -> str:
+    body = str(entry.get("text") or "").strip()
+    if body:
+        return body
+    abstract = str(entry.get("abstract") or "").strip()
+    title = str(entry.get("title") or "").strip()
+    return "\n\n".join(part for part in [title, abstract] if part).strip() or _format_text_from_entry(entry)
+
+
+def _paper_body_chunks(
+    entry: Dict[str, Any],
+    *,
+    chunk_chars: int,
+    overlap: int,
+    max_chunks: int | None = None,
+) -> List[Tuple[str, int]]:
+    chunks: List[Tuple[str, int]] = []
+    for chunk, offset in _chunk_text(
+        _paper_body_text(entry),
+        chunk_chars=max(512, int(chunk_chars or 0)),
+        overlap=max(0, int(overlap or 0)),
+    ):
+        normalized = str(chunk or "").strip()
+        if not normalized:
+            continue
+        chunks.append((normalized, offset))
+        if max_chunks is not None and len(chunks) >= max_chunks:
+            break
+    return chunks
+
+
+def _split_sentences(text: str, max_sentences: int) -> List[str]:
+    sentences = [seg.strip() for seg in re.split(r"(?<=[.!?])\s+", text or "") if seg.strip()]
+    return sentences[:max(1, max_sentences)]
+
+
+def _paper_keyword_target(row: Dict[str, Any], max_keywords: int = 8) -> str:
+    weighted_terms: Counter[str] = Counter()
+
+    def _add_terms(text: str, weight: float, *, include_bigrams: bool) -> None:
+        tokens = [
+            token.lower()
+            for token in _KEYWORD_TOKEN_RE.findall(text or "")
+            if len(token) >= 4 and token.lower() not in _KEYWORD_STOPWORDS and not token.lower().startswith("cs.")
+        ]
+        if not tokens:
+            return
+        for token in tokens:
+            weighted_terms[token] += weight
+        if include_bigrams:
+            for left, right in zip(tokens, tokens[1:]):
+                if left == right:
+                    continue
+                phrase = f"{left} {right}"
+                weighted_terms[phrase] += weight + 0.35
+
+    title = str(row.get("title") or "").strip()
+    abstract = str(row.get("abstract") or "").strip()
+    body = str(row.get("text") or "").strip()
+    _add_terms(title, 3.0, include_bigrams=True)
+    _add_terms(abstract, 2.0, include_bigrams=True)
+    _add_terms(body[:4000], 1.0, include_bigrams=False)
+
+    selected: List[str] = []
+    seen_tokens: set[str] = set()
+    for term, _score in weighted_terms.most_common(max(max_keywords * 4, 16)):
+        parts = term.split()
+        if any(part in seen_tokens for part in parts):
+            continue
+        selected.append(term)
+        seen_tokens.update(parts)
+        if len(selected) >= max_keywords:
+            break
+
+    if not selected:
+        fallback_text = title or abstract or body
+        fallback_tokens = [token.lower() for token in _KEYWORD_TOKEN_RE.findall(fallback_text or "") if len(token) >= 4]
+        selected = fallback_tokens[:max_keywords]
+    return ", ".join(selected[:max_keywords]).strip() or (title or abstract or "keyword")
+
+
+def _paper_retrieval_query(row: Dict[str, Any]) -> str:
+    title = str(row.get("title") or "").strip()
+    abstract = str(row.get("abstract") or "").strip()
+    if title and abstract:
+        return f"TITLE:\n{title}\nABSTRACT:\n{abstract}"
+    if title:
+        return f"TITLE:\n{title}"
+    if abstract:
+        return f"ABSTRACT:\n{abstract}"
+    return _format_text_from_entry(row)
+
+
+def _metadata_embedding_query(entry: Dict[str, Any]) -> str:
+    title = str(entry.get("title") or "").strip()
+    abstract = str(entry.get("abstract") or "").strip()
+    if title and abstract:
+        return f"TITLE:\n{title}\nABSTRACT:\n{abstract}"
+    if title:
+        return f"TITLE:\n{title}"
+    if abstract:
+        return f"ABSTRACT:\n{abstract}"
+    return _format_text_from_entry(entry)
+
+
+def _metadata_embedding_doc(entry: Dict[str, Any]) -> str:
+    title = str(entry.get("title") or "").strip()
+    abstract = str(entry.get("abstract") or "").strip()
+    categories = str(entry.get("categories") or entry.get("primary_category") or "").strip()
+    authors = entry.get("authors") or ""
+    if isinstance(authors, (list, tuple)):
+        authors_text = ", ".join(str(item or "").strip() for item in authors if str(item or "").strip())
+    else:
+        authors_text = str(authors or "").strip()
+    parts = []
+    if title:
+        parts.append(f"Title: {title}")
+    if abstract:
+        parts.append(f"Abstract: {abstract}")
+    if categories:
+        parts.append(f"Categories: {categories}")
+    if authors_text:
+        parts.append(f"Authors: {authors_text}")
+    return "\n".join(parts).strip() or _format_text_from_entry(entry)
+
+
+def _paper_document_view(row: Dict[str, Any], *, max_chars: int = 6000) -> str:
+    text = _compose_full_paper_text(row)
+    return text[: max(512, int(max_chars or 0))].strip()
+
+
+def _build_paper_method_summary_samples(rows: List[Dict[str, Any]], max_samples: int) -> List[Dict[str, Any]]:
+    samples: List[Dict[str, Any]] = []
+    for row in rows[:max_samples]:
+        abstract = str(row.get("abstract") or "").strip()
+        target = _paper_method_summary_target(row)
+        prompt = abstract or _format_text_from_entry(row)
+        samples.append({"text": prompt, "target": target})
+    return samples
+
+
+def _paper_method_summary_target(row: Dict[str, Any]) -> str:
+    hint_terms = (
+        "we propose",
+        "we present",
+        "our method",
+        "this paper introduces",
+        "we introduce",
+        "we develop",
+        "we describe",
+    )
+    abstract = str(row.get("abstract") or "").strip()
+    full_text = str(row.get("text") or "").strip()
+    target_sentences: List[str] = []
+    for sentence in _split_sentences(full_text or abstract, max_sentences=8):
+        if any(term in sentence.lower() for term in hint_terms):
+            target_sentences.append(sentence)
+        if len(target_sentences) >= 3:
+            break
+    if not target_sentences:
+        target_sentences = _split_sentences(abstract or full_text, max_sentences=3)
+    return " ".join(target_sentences).strip() or abstract or _format_text_from_entry(row)
+
+
+def _paper_problem_target(row: Dict[str, Any]) -> str:
+    abstract = str(row.get("abstract") or "").strip()
+    full_text = str(row.get("text") or "").strip()
+    sentences = _split_sentences(abstract or full_text, max_sentences=2)
+    return " ".join(sentences).strip() or abstract or _format_text_from_entry(row)
+
+
+def _paper_results_target(row: Dict[str, Any]) -> str:
+    hint_terms = (
+        "results show",
+        "we show",
+        "our experiments",
+        "experiments show",
+        "we achieve",
+        "outperform",
+        "demonstrate",
+        "improves",
+        "improvement",
+        "state-of-the-art",
+    )
+    abstract = str(row.get("abstract") or "").strip()
+    full_text = str(row.get("text") or "").strip()
+    target_sentences: List[str] = []
+    for sentence in _split_sentences(full_text or abstract, max_sentences=12):
+        if any(term in sentence.lower() for term in hint_terms):
+            target_sentences.append(sentence)
+        if len(target_sentences) >= 2:
+            break
+    if not target_sentences:
+        abstract_sentences = _split_sentences(abstract or full_text, max_sentences=4)
+        target_sentences = abstract_sentences[-2:] if len(abstract_sentences) >= 2 else abstract_sentences
+    return " ".join(target_sentences).strip() or abstract or _format_text_from_entry(row)
+
+
+def _paper_qa_context(row: Dict[str, Any], max_chars: int = 2400) -> str:
+    title = str(row.get("title") or "").strip()
+    abstract = str(row.get("abstract") or "").strip()
+    body = str(row.get("text") or "").strip()
+    parts = []
+    if title:
+        parts.append(f"Title: {title}")
+    if abstract:
+        parts.append(f"Abstract: {abstract}")
+    if body:
+        parts.append(f"Paper Body: {body[:max_chars]}")
+    return "\n\n".join(parts).strip() or _format_text_from_entry(row)
+
+
+def _build_paper_keyword_samples(rows: List[Dict[str, Any]], max_samples: int) -> List[Dict[str, Any]]:
+    samples: List[Dict[str, Any]] = []
+    for row in rows[:max_samples]:
+        prompt = str(row.get("abstract") or "").strip() or _format_text_from_entry(row)
+        samples.append({"text": prompt, "target": _paper_keyword_target(row)})
+    return samples
+
+
+def _build_paper_qa_samples(rows: List[Dict[str, Any]], max_samples: int) -> List[Dict[str, Any]]:
+    samples: List[Dict[str, Any]] = []
+    for row in rows:
+        if len(samples) >= max_samples:
+            break
+        title = str(row.get("title") or "").strip() or "this paper"
+        context = _paper_qa_context(row)
+        qa_pairs = [
+            {
+                "question": f"What problem does the paper '{title}' address?",
+                "target": _paper_problem_target(row),
+            },
+            {
+                "question": f"What method does the paper '{title}' propose?",
+                "target": _paper_method_summary_target(row),
+            },
+            {
+                "question": f"What results or findings does the paper '{title}' report?",
+                "target": _paper_results_target(row),
+            },
+        ]
+        for qa in qa_pairs:
+            if len(samples) >= max_samples:
+                break
+            if not str(qa["target"] or "").strip():
+                continue
+            samples.append(
+                {
+                    "question": qa["question"],
+                    "context": context,
+                    "target": qa["target"],
+                    "paper_id": row.get("canonical_paper_id") or row.get("paper_id"),
+                    "pdf_path": row.get("pdf_path"),
+                }
+            )
+    return samples[:max_samples]
+
+
+def _build_paper_retrieval_samples(
+    rows: List[Dict[str, Any]],
+    max_samples: int,
+    *,
+    chunk_chars: int,
+    overlap: int,
+    max_chunks_per_paper: int = 2,
+) -> List[Dict[str, Any]]:
+    samples: List[Dict[str, Any]] = []
+    if not rows:
+        return samples
+
+    chunk_records: List[Dict[str, Any]] = []
+    for row in rows:
+        paper_id = row.get("canonical_paper_id") or row.get("paper_id")
+        if not paper_id:
+            continue
+        chunks = _paper_body_chunks(
+            row,
+            chunk_chars=chunk_chars,
+            overlap=overlap,
+            max_chunks=max_chunks_per_paper,
+        )
+        if not chunks:
+            continue
+        chunk_records.append(
+            {
+                "paper_id": paper_id,
+                "query": _paper_retrieval_query(row),
+                "category": str(row.get("primary_category") or row.get("categories") or ""),
+                "chunks": chunks,
+            }
+        )
+
+    if len(chunk_records) < 2:
+        return samples
+
+    for idx, record in enumerate(chunk_records):
+        if len(samples) >= max_samples:
+            break
+        other = chunk_records[(idx + 1) % len(chunk_records)]
+        if other["paper_id"] == record["paper_id"] and len(chunk_records) > 1:
+            other = chunk_records[(idx + 2) % len(chunk_records)]
+        for chunk_text, offset in record["chunks"]:
+            samples.append(
+                {
+                    "text_a": record["query"],
+                    "text_b": f"PAPER_SPAN:\n{chunk_text}",
+                    "label": 1,
+                    "paper_id": record["paper_id"],
+                    "offset": offset,
+                }
+            )
+            if len(samples) >= max_samples:
+                break
+            negative_chunk, negative_offset = other["chunks"][0]
+            samples.append(
+                {
+                    "text_a": record["query"],
+                    "text_b": f"PAPER_SPAN:\n{negative_chunk}",
+                    "label": 0,
+                    "paper_id": other["paper_id"],
+                    "offset": negative_offset,
+                }
+            )
+            if len(samples) >= max_samples:
+                break
+    return samples[:max_samples]
+
+
+def _build_metadata_embedding_samples(manifest_entries: List[Dict[str, Any]], max_samples: int) -> List[Dict[str, Any]]:
+    samples: List[Dict[str, Any]] = []
+    if not manifest_entries:
+        return samples
+
+    records: List[Dict[str, Any]] = []
+    for entry in manifest_entries:
+        paper_id = _entry_paper_id(entry)
+        query = _metadata_embedding_query(entry)
+        doc = _metadata_embedding_doc(entry)
+        if not query or not doc:
+            continue
+        records.append({"paper_id": paper_id, "query": query, "doc": doc})
+
+    if len(records) < 2:
+        return samples
+
+    for idx, record in enumerate(records):
+        if len(samples) >= max_samples:
+            break
+        other = records[(idx + 1) % len(records)]
+        if other["doc"] == record["doc"] and len(records) > 1:
+            other = records[(idx + 2) % len(records)]
+        samples.append(
+            {
+                "text_a": record["query"],
+                "text_b": f"METADATA_CARD:\n{record['doc']}",
+                "label": 1,
+                "paper_id": record["paper_id"],
+            }
+        )
+        if len(samples) >= max_samples:
+            break
+        samples.append(
+            {
+                "text_a": record["query"],
+                "text_b": f"METADATA_CARD:\n{other['doc']}",
+                "label": 0,
+                "paper_id": other["paper_id"],
+            }
+        )
+    return samples[:max_samples]
+
+
+def _build_paper_fulltext_embedding_samples(
+    rows: List[Dict[str, Any]],
+    max_samples: int,
+    *,
+    chunk_chars: int,
+    overlap: int,
+    max_chunks_per_paper: int = 2,
+    document_chars: int = 6000,
+) -> List[Dict[str, Any]]:
+    samples: List[Dict[str, Any]] = []
+    if not rows:
+        return samples
+
+    records: List[Dict[str, Any]] = []
+    for row in rows:
+        paper_id = _entry_paper_id(row)
+        if not paper_id:
+            continue
+        document = _paper_document_view(row, max_chars=document_chars)
+        chunks = _paper_body_chunks(
+            row,
+            chunk_chars=chunk_chars,
+            overlap=overlap,
+            max_chunks=max_chunks_per_paper,
+        )
+        if not document or not chunks:
+            continue
+        records.append(
+            {
+                "paper_id": paper_id,
+                "query": _paper_retrieval_query(row),
+                "document": document,
+                "chunks": chunks,
+            }
+        )
+
+    if len(records) < 2:
+        return samples
+
+    for idx, record in enumerate(records):
+        if len(samples) >= max_samples:
+            break
+        other = records[(idx + 1) % len(records)]
+        if other["paper_id"] == record["paper_id"] and len(records) > 1:
+            other = records[(idx + 2) % len(records)]
+        samples.append(
+            {
+                "text_a": record["query"],
+                "text_b": f"PAPER_DOCUMENT:\n{record['document']}",
+                "label": 1,
+                "paper_id": record["paper_id"],
+                "retrieval_level": "document",
+            }
+        )
+        if len(samples) >= max_samples:
+            break
+        samples.append(
+            {
+                "text_a": record["query"],
+                "text_b": f"PAPER_DOCUMENT:\n{other['document']}",
+                "label": 0,
+                "paper_id": other["paper_id"],
+                "retrieval_level": "document",
+            }
+        )
+        if len(samples) >= max_samples:
+            break
+        for chunk_text, offset in record["chunks"]:
+            samples.append(
+                {
+                    "text_a": record["query"],
+                    "text_b": f"PAPER_SPAN:\n{chunk_text}",
+                    "label": 1,
+                    "paper_id": record["paper_id"],
+                    "offset": offset,
+                    "retrieval_level": "chunk",
+                }
+            )
+            if len(samples) >= max_samples:
+                break
+            negative_chunk, negative_offset = other["chunks"][0]
+            samples.append(
+                {
+                    "text_a": record["query"],
+                    "text_b": f"PAPER_SPAN:\n{negative_chunk}",
+                    "label": 0,
+                    "paper_id": other["paper_id"],
+                    "offset": negative_offset,
+                    "retrieval_level": "chunk",
+                }
+            )
+            if len(samples) >= max_samples:
+                break
+    return samples[:max_samples]
+
+
+_SENTENCE_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}")
+_SENTENCE_STOPWORDS = {
+    "about",
+    "after",
+    "also",
+    "among",
+    "between",
+    "from",
+    "into",
+    "method",
+    "methods",
+    "model",
+    "models",
+    "paper",
+    "result",
+    "results",
+    "study",
+    "their",
+    "these",
+    "this",
+    "using",
+    "with",
+}
+
+
+def _sentence_tokens(text: str) -> List[str]:
+    return [
+        token.lower()
+        for token in _SENTENCE_TOKEN_RE.findall(text or "")
+        if token.lower() not in _SENTENCE_STOPWORDS
+    ]
+
+
+def _sentence_overlap_score(left: str, right: str) -> float:
+    left_tokens = set(_sentence_tokens(left))
+    right_tokens = set(_sentence_tokens(right))
+    if not left_tokens or not right_tokens:
+        return 0.0
+    overlap = left_tokens & right_tokens
+    denom = max(1, min(len(left_tokens), len(right_tokens)))
+    return float(len(overlap)) / float(denom)
+
+
+def _build_paper_sentence_embedding_samples(
+    rows: List[Dict[str, Any]],
+    max_samples: int,
+    *,
+    max_query_sentences: int = 3,
+    max_body_sentences: int = 16,
+) -> List[Dict[str, Any]]:
+    samples: List[Dict[str, Any]] = []
+    if not rows:
+        return samples
+
+    records: List[Dict[str, Any]] = []
+    for row in rows:
+        paper_id = _entry_paper_id(row)
+        if not paper_id:
+            continue
+        title = str(row.get("title") or "").strip()
+        abstract_sentences = _split_sentences(str(row.get("abstract") or "").strip(), max_sentences=max_query_sentences * 2)
+        body_sentences = _split_sentences(_paper_body_text(row), max_sentences=max_body_sentences)
+        if not abstract_sentences or not body_sentences:
+            continue
+        sentence_pairs: List[Tuple[str, str]] = []
+        for query_sentence in abstract_sentences[:max_query_sentences]:
+            best_body = max(body_sentences, key=lambda candidate: (_sentence_overlap_score(query_sentence, candidate), -abs(len(candidate) - len(query_sentence))))
+            sentence_pairs.append((query_sentence, best_body))
+        records.append({"paper_id": paper_id, "title": title, "pairs": sentence_pairs})
+
+    if len(records) < 2:
+        return samples
+
+    for idx, record in enumerate(records):
+        if len(samples) >= max_samples:
+            break
+        other = records[(idx + 1) % len(records)]
+        if other["paper_id"] == record["paper_id"] and len(records) > 1:
+            other = records[(idx + 2) % len(records)]
+        for sentence_idx, (query_sentence, body_sentence) in enumerate(record["pairs"]):
+            query_parts = []
+            if record["title"]:
+                query_parts.append(f"TITLE:\n{record['title']}")
+            query_parts.append(f"ABSTRACT_SENTENCE:\n{query_sentence}")
+            samples.append(
+                {
+                    "text_a": "\n".join(query_parts),
+                    "text_b": f"PAPER_SENTENCE:\n{body_sentence}",
+                    "label": 1,
+                    "paper_id": record["paper_id"],
+                    "sentence_idx": sentence_idx,
+                    "retrieval_level": "sentence",
+                }
+            )
+            if len(samples) >= max_samples:
+                break
+            negative_sentence = other["pairs"][sentence_idx % len(other["pairs"])][1]
+            samples.append(
+                {
+                    "text_a": "\n".join(query_parts),
+                    "text_b": f"PAPER_SENTENCE:\n{negative_sentence}",
+                    "label": 0,
+                    "paper_id": other["paper_id"],
+                    "sentence_idx": sentence_idx,
+                    "retrieval_level": "sentence",
+                }
+            )
+            if len(samples) >= max_samples:
+                break
+    return samples[:max_samples]
+
+
+def _build_fulltext_samples(
+    rows: List[Dict[str, Any]],
+    max_samples: int,
+    *,
+    chunk_chars: int,
+    overlap: int,
+    target_mode: str = "none",
+) -> List[Dict[str, Any]]:
+    samples: List[Dict[str, Any]] = []
+    for row in rows:
+        if len(samples) >= max_samples:
+            break
+        chunks = list(
+            _chunk_text(
+                _compose_full_paper_text(row),
+                chunk_chars=max(512, int(chunk_chars or 0)),
+                overlap=max(0, int(overlap or 0)),
+            )
+        )
+        if not chunks:
+            continue
+        for idx, (chunk, offset) in enumerate(chunks):
+            chunk = str(chunk or "").strip()
+            if not chunk:
+                continue
+            target = None
+            if target_mode == "next_chunk":
+                if idx + 1 >= len(chunks):
+                    continue
+                target = str(chunks[idx + 1][0] or "").strip()
+                if not target:
+                    continue
+            elif target_mode == "same_chunk":
+                target = chunk
+            samples.append(
+                {
+                    "text": chunk,
+                    "target": target,
+                    "paper_id": row.get("canonical_paper_id") or row.get("paper_id"),
+                    "pdf_path": row.get("pdf_path"),
+                    "offset": offset,
+                    "label": 0,
+                }
+            )
+            if len(samples) >= max_samples:
+                break
+    return samples[:max_samples]
+
+
 def _build_contrastive(manifest_entries: List[Dict[str, Any]], max_samples: int) -> List[Dict[str, Any]]:
     if not manifest_entries:
         return []
@@ -507,13 +1312,95 @@ def _build_contrastive(manifest_entries: List[Dict[str, Any]], max_samples: int)
     return samples
 
 
+def _resolve_teacher_embedding_path(construction: Dict[str, Any]) -> Path | None:
+    teacher_kind = str(
+        construction.get("teacher_embeddings")
+        or construction.get("teacher_embedding_source")
+        or ""
+    ).strip().lower()
+    explicit_path = construction.get("teacher_embedding_path")
+    if explicit_path:
+        resolved = _resolve_data_file(explicit_path)
+        return resolved if resolved.exists() else None
+    if not teacher_kind or teacher_kind in {"none", "disabled"}:
+        return None
+    universe_dir = _resolve_data_dir(
+        construction.get("paper_universe_dir") or DEFAULT_PAPER_UNIVERSE_DIR,
+        "*.parquet",
+    )
+    if teacher_kind in {"fulltext", "paper_fulltext", "paper_fulltext_embeddings"}:
+        candidate = universe_dir / "paper_fulltext_embeddings.parquet"
+        return candidate if candidate.exists() else None
+    if teacher_kind in {"metadata", "paper_embeddings"}:
+        candidate = universe_dir / "paper_embeddings.parquet"
+        return candidate if candidate.exists() else None
+    return None
+
+
+def _load_teacher_embedding_lookup(paper_ids: Iterable[str], construction: Dict[str, Any]) -> Dict[str, List[float]]:
+    if pq is None:
+        return {}
+    wanted = {str(paper_id or "").strip() for paper_id in paper_ids if str(paper_id or "").strip()}
+    if not wanted:
+        return {}
+    embedding_path = _resolve_teacher_embedding_path(construction)
+    if embedding_path is None or not embedding_path.exists():
+        return {}
+
+    lookup: Dict[str, List[float]] = {}
+    try:
+        parquet_file = pq.ParquetFile(embedding_path)
+    except Exception:
+        return {}
+    schema_names = set(getattr(getattr(parquet_file, "schema_arrow", None), "names", []) or [])
+    if not schema_names:
+        try:
+            schema_names = set(parquet_file.schema.names)
+        except Exception:
+            schema_names = set()
+    available_columns = [col for col in ["paper_id", "canonical_paper_id", "embedding"] if col in schema_names]
+    if "embedding" not in available_columns:
+        return {}
+    for batch in parquet_file.iter_batches(columns=available_columns, batch_size=2048):
+        for row in batch.to_pylist():
+            if not isinstance(row, dict):
+                continue
+            paper_id = str(row.get("canonical_paper_id") or row.get("paper_id") or "").strip()
+            if not paper_id or paper_id not in wanted:
+                continue
+            embedding = row.get("embedding")
+            if isinstance(embedding, list) and embedding:
+                lookup[paper_id] = [float(value) for value in embedding]
+        if len(lookup) >= len(wanted):
+            break
+    return lookup
+
+
+def _attach_teacher_embeddings(samples: List[Dict[str, Any]], construction: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not samples:
+        return samples
+    lookup = _load_teacher_embedding_lookup(
+        (sample.get("paper_id") for sample in samples),
+        construction,
+    )
+    if not lookup:
+        return samples
+    default_embedding = [0.0 for _ in range(len(next(iter(lookup.values()))))]
+    for sample in samples:
+        paper_id = str(sample.get("paper_id") or "").strip()
+        embedding = lookup.get(paper_id)
+        sample["teacher_embedding"] = list(embedding) if embedding is not None else list(default_embedding)
+        sample["teacher_mask"] = 1 if embedding is not None else 0
+    return samples
+
+
 def _build_classifier(manifest_entries: List[Dict[str, Any]], max_samples: int) -> List[Dict[str, Any]]:
     if not manifest_entries:
         return []
     samples = []
     for e in manifest_entries[:max_samples]:
         text = _format_text_from_entry(e)
-        cat = e.get("categories") or e.get("primary_category") or "unknown"
+        cat = e.get("primary_category") or e.get("categories") or "unknown"
         samples.append({"text": text, "label": cat})
     return samples
 
@@ -573,11 +1460,21 @@ def build_dataset(config: Dict[str, Any]):
     max_samples = construction.get("max_samples", 32)
     chunk_chars_pdf = construction.get("chunk_chars_pdf", 8000)
     chunk_overlap_pdf = construction.get("chunk_overlap_pdf", 400)
+    chunk_chars_text = construction.get("chunk_chars_text", chunk_chars_pdf)
+    chunk_overlap_text = construction.get("chunk_overlap_text", chunk_overlap_pdf)
     chunk_chars_code = construction.get("chunk_chars_code", 4000)
     chunk_overlap_code = construction.get("chunk_overlap_code", 200)
     structured_pdf_dir = _resolve_data_dir(
         construction.get("structured_pdf_dir") or "exports/pdfs_structured",
         "pdf_structured_*.jsonl",
+    )
+    paper_dataset_dir = _resolve_data_dir(
+        construction.get("paper_dataset_dir") or DEFAULT_PAPER_DATASET_DIR,
+        "*.parquet",
+    )
+    paper_universe_dir = _resolve_data_dir(
+        construction.get("paper_universe_dir") or DEFAULT_PAPER_UNIVERSE_DIR,
+        "*.parquet",
     )
     alignment_path = _resolve_data_file(construction.get("alignment_path") or "exports/paper_repo_align.jsonl")
     sources = config.get("dataset", {}).get("sources", [])
@@ -590,10 +1487,21 @@ def build_dataset(config: Dict[str, Any]):
 
     if archetype_name == "graph":
         try:
-            graph_samples = load_graph_samples(max_samples=max_samples // 2)
-            paper_samples = load_paper_graph_samples(max_samples=max_samples - len(graph_samples))
-            samples.extend([graph_sample_to_text(gs) for gs in graph_samples])
-            samples.extend([paper_sample_to_text(ps) for ps in paper_samples])
+            source_set = set(sources)
+            wants_repo_graph = (not source_set) or ("github_repos" in source_set)
+            wants_paper_graph = (not source_set) or bool(source_set & {"arxiv_metadata", "paper_text_parquet", "paper_universe", "paper_universe_graph"})
+            if wants_repo_graph:
+                repo_budget = max_samples if not wants_paper_graph else max(1, max_samples // 2)
+                graph_samples = load_graph_samples(max_samples=repo_budget)
+                samples.extend([graph_sample_to_text(gs) for gs in graph_samples])
+            if wants_paper_graph and len(samples) < max_samples:
+                prefer_universe = bool(source_set & {"paper_universe", "paper_universe_graph"}) or paper_universe_dir.exists()
+                paper_samples = load_paper_graph_samples(
+                    max_samples=max_samples - len(samples),
+                    universe_dir=paper_universe_dir,
+                    prefer_universe=prefer_universe,
+                )
+                samples.extend([paper_sample_to_text(ps) for ps in paper_samples])
         except Exception:
             pass
         return samples[:max_samples] if samples else [{"text": "graph placeholder", "label": 0}]
@@ -603,6 +1511,61 @@ def build_dataset(config: Dict[str, Any]):
         if "arxiv_metadata" in sources:
             manifest = load_manifest()
             manifest_entries = _sample_metadata(manifest, max_samples, filters)
+            if model_id == "M1":
+                samples.extend(_build_metadata_embedding_samples(manifest_entries, max_samples))
+                manifest_entries = []
+        if "paper_text_parquet" in sources:
+            paper_rows = _sample_paper_text_parquet(max_samples, filters, paper_dataset_dir)
+            if model_id == "M6":
+                samples.extend(
+                    _build_paper_fulltext_embedding_samples(
+                        paper_rows,
+                        max_samples,
+                        chunk_chars=chunk_chars_text,
+                        overlap=chunk_overlap_text,
+                        max_chunks_per_paper=int(construction.get("max_chunks_per_paper", 2) or 2),
+                        document_chars=int(construction.get("document_chars", 6000) or 6000),
+                    )
+                )
+            elif model_id == "M7":
+                samples.extend(
+                    _build_paper_sentence_embedding_samples(
+                        paper_rows,
+                        max_samples,
+                        max_query_sentences=int(construction.get("max_query_sentences", 3) or 3),
+                        max_body_sentences=int(construction.get("max_body_sentences", 16) or 16),
+                    )
+                )
+            elif model_id == "M1":
+                samples.extend(
+                    _build_metadata_embedding_samples(paper_rows, max_samples)
+                )
+            elif model_id in {"P1", "C3"}:
+                samples.extend(
+                    _build_fulltext_samples(
+                        paper_rows,
+                        max_samples,
+                        chunk_chars=chunk_chars_text,
+                        overlap=chunk_overlap_text,
+                        target_mode=(
+                            "next_chunk"
+                            if model_id == "P1"
+                            and (
+                                config.get("training", {}).get("model_type") == "seq2seq"
+                                or config.get("backbone", {}).get("type") == "encoder_decoder"
+                            )
+                            else "none"
+                        ),
+                    )
+                )
+            elif model_id == "A2":
+                samples.extend(_build_paper_method_summary_samples(paper_rows, max_samples))
+            elif model_id == "A3":
+                samples.extend(_build_paper_keyword_samples(paper_rows, max_samples))
+            elif model_id == "P5":
+                samples.extend(_build_paper_qa_samples(paper_rows, max_samples))
+            else:
+                manifest_entries.extend(paper_rows)
         if archetype_name == "contrastive" and manifest_entries:
             samples.extend(_build_contrastive(manifest_entries, max_samples))
         elif archetype_name == "classifier" and manifest_entries:
@@ -671,5 +1634,8 @@ def build_dataset(config: Dict[str, Any]):
     if not samples:
         model_id = config.get("model_id", "UNK")
         samples = [{"text": f"placeholder sample for {model_id}", "label": 0} for _ in range(min(max_samples, 32))]
+
+    if samples and model_id in {"M6", "M7"}:
+        samples = _attach_teacher_embeddings(samples, construction)
 
     return samples[:max_samples]

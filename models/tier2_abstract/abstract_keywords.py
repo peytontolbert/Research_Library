@@ -1,14 +1,14 @@
 """
 Model 8: Abstract → Paper Keywords (A3).
-HF-backed classifier/generative tagger for keywords.
+HF-backed generative keyword tagger.
 """
 
 from typing import Any, Dict, Optional
 
-from models.shared.modeling import ClassifierModel
+from models.shared.modeling import GenerativeModel
 
 
-class AbstractKeywordsModel(ClassifierModel):
+class AbstractKeywordsModel(GenerativeModel):
     """HF-backed keyword predictor (A3) with frequency fallback."""
 
     def __init__(self, tokenizer: Any = None, backbone: Any = None, config: Optional[Dict[str, Any]] = None) -> None:
@@ -16,8 +16,8 @@ class AbstractKeywordsModel(ClassifierModel):
 
     def predict(self, batch):
         if self._ensure_ready():
-            texts = [str(ex.get("abstract") or ex.get("text") or "") for ex in batch]
-            return super().predict(texts)
+            prompts = [str(ex.get("abstract") or ex.get("text") or "") for ex in batch]
+            return super().generate(prompts, max_new_tokens=32, temperature=0.1)
 
         import re
         outputs = []

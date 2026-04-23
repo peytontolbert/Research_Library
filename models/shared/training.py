@@ -4,9 +4,31 @@ This remains lightweight and dependency-optional; actual HF imports are lazy.
 """
 
 import os
+import sys
+import inspect
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional
-from models.shared.data import build_dataset
+from models.shared.data import (
+    _attach_teacher_embeddings,
+    _build_metadata_embedding_samples,
+    build_dataset,
+    _build_fulltext_samples,
+    _build_paper_keyword_samples,
+    _build_paper_qa_samples,
+    _build_paper_fulltext_embedding_samples,
+    _build_paper_retrieval_samples,
+    _build_paper_sentence_embedding_samples,
+    _chunk_text,
+    _compose_full_paper_text,
+    _format_text_from_entry,
+    _load_teacher_embedding_lookup,
+    _normalize_paper_row,
+    _paper_keyword_target,
+    _paper_method_summary_target,
+    _paper_parquet_paths,
+    _paper_row_year,
+)
 from models.shared.config import validate_cache_dirs
 from models.shared.archetypes import get_archetype
 from models.shared.code_encoder import CodeEncoder
@@ -17,6 +39,30 @@ try:
     import torch
 except Exception:  # pragma: no cover - optional dependency
     torch = None
+
+if torch is not None and not hasattr(torch, "Tensor"):  # pragma: no cover - broken optional dependency
+    sys.modules.pop("torch", None)
+    torch = None
+
+
+@contextmanager
+def _datasets_fingerprint_compatible_env():
+    """
+    The `datasets` package inspects `sys.modules["torch"]` while fingerprinting
+    configs and map functions. Some environments expose a partial torch module
+    without `Tensor`, which crashes that inspection path. Hide that module for
+    the duration of dataset construction.
+    """
+    removed_torch = None
+    torch_module = sys.modules.get("torch")
+    if torch_module is not None and not hasattr(torch_module, "Tensor"):
+        removed_torch = torch_module
+        sys.modules.pop("torch", None)
+    try:
+        yield
+    finally:
+        if removed_torch is not None:
+            sys.modules["torch"] = removed_torch
 
 try:
     from transformers import (
@@ -83,17 +129,208 @@ def build_tokenizer(config: Dict[str, Any]):
     return tok
 
 
+def _iter_backbone_configs(backbone: Any) -> list[Any]:
+    if backbone is None:
+        return []
+    candidates = [backbone]
+    seen_ids = set()
+    configs = []
+    while candidates:
+        current = candidates.pop(0)
+        if current is None:
+            continue
+        ident = id(current)
+        if ident in seen_ids:
+            continue
+        seen_ids.add(ident)
+        cfg = getattr(current, "config", None)
+        if cfg is not None:
+            configs.append(cfg)
+        for attr in ("base_model", "model"):
+            nested = getattr(current, attr, None)
+            if nested is not None:
+                candidates.append(nested)
+        getter = getattr(current, "get_base_model", None)
+        if callable(getter):
+            try:
+                nested = getter()
+            except Exception:
+                nested = None
+            if nested is not None:
+                candidates.append(nested)
+    return configs
+
+
+def _effective_model_max_length(tokenizer: Any = None, backbone: Any = None) -> Optional[int]:
+    limits = []
+    tokenizer_limit = getattr(tokenizer, "model_max_length", None)
+    try:
+        tokenizer_limit_int = int(tokenizer_limit)
+    except Exception:
+        tokenizer_limit_int = None
+    if tokenizer_limit_int and 0 < tokenizer_limit_int < 1_000_000:
+        limits.append(tokenizer_limit_int)
+
+    for backbone_cfg in _iter_backbone_configs(backbone):
+        for attr in ("max_position_embeddings", "n_positions", "max_sequence_length"):
+            value = getattr(backbone_cfg, attr, None)
+            try:
+                value_int = int(value)
+            except Exception:
+                value_int = None
+            if value_int and 0 < value_int < 1_000_000:
+                limits.append(value_int)
+    if not limits:
+        return None
+    return int(min(limits))
+
+
+def _effective_source_token_limit(config: Dict[str, Any], tokenizer: Any = None, backbone: Any = None) -> int:
+    configured = ((config.get("dataset") or {}).get("tokenization") or {}).get("max_source_tokens", 2048)
+    try:
+        configured_limit = int(configured)
+    except Exception:
+        configured_limit = 2048
+    model_limit = _effective_model_max_length(tokenizer=tokenizer, backbone=backbone)
+    if model_limit is None:
+        return max(8, configured_limit)
+    return max(8, min(configured_limit, model_limit))
+
+
+_SEQ2SEQ_MODEL_IDS = {"A2", "A3", "P1", "P2", "P3", "P4", "P5", "R3", "R5", "C1"}
+
+
+def _resolve_backbone_type(config: Dict[str, Any]) -> Optional[str]:
+    backbone_cfg = config.get("backbone", {}) or {}
+    model_type = backbone_cfg.get("type")
+    base_model = str(backbone_cfg.get("base_model") or "")
+    # Llama-family checkpoints are decoder-only; treat mislabeled configs as such.
+    if model_type == "encoder" and "llama" in base_model.lower():
+        return "decoder"
+    return model_type
+
+
+def _prefer_seq2seq_config(config: Dict[str, Any]) -> bool:
+    training_cfg = config.get("training", {}) or {}
+    if training_cfg.get("model_type") == "seq2seq":
+        return True
+    if _resolve_backbone_type(config) == "encoder_decoder":
+        return True
+    return config.get("model_id") in _SEQ2SEQ_MODEL_IDS
+
+
+def _is_classifier_config(config: Dict[str, Any]) -> bool:
+    training_cfg = config.get("training", {}) or {}
+    archetype = get_archetype(config.get("model_id", "")) or {}
+    return archetype.get("archetype") == "classifier" or training_cfg.get("model_type") == "classifier"
+
+
+def _infer_peft_task_type(config: Dict[str, Any]) -> str:
+    model_type = _resolve_backbone_type(config)
+    archetype = get_archetype(config.get("model_id", "")) or {}
+    if model_type == "encoder_decoder" or _prefer_seq2seq_config(config):
+        return "SEQ_2_SEQ_LM"
+    if _is_classifier_config(config):
+        return "SEQ_CLS"
+    if model_type == "encoder" or archetype.get("archetype") == "contrastive":
+        return "FEATURE_EXTRACTION"
+    return "CAUSAL_LM"
+
+
+def _resolve_eval_split(config: Dict[str, Any]) -> float:
+    training_cfg = config.get("training", {}) or {}
+    if training_cfg.get("eval_split") is not None:
+        try:
+            return max(0.0, min(0.5, float(training_cfg.get("eval_split") or 0.0)))
+        except Exception:
+            return 0.0
+    construction = ((config.get("dataset") or {}).get("construction") or {})
+    split = construction.get("train_val_test_split") or []
+    if isinstance(split, (list, tuple)) and len(split) >= 2:
+        try:
+            return max(0.0, min(0.5, float(split[1] or 0.0)))
+        except Exception:
+            return 0.0
+    return 0.0
+
+
+def _normalize_dataset_splits(ds: Any) -> Any:
+    if not isinstance(ds, dict):
+        return ds
+    train_ds = ds.get("train")
+    eval_ds = ds.get("eval")
+    if eval_ds is None:
+        eval_ds = ds.get("validation")
+    if eval_ds is None:
+        eval_ds = ds.get("test")
+    if train_ds is None:
+        train_ds = ds.get("train") or eval_ds
+    if train_ds is None:
+        return ds
+    out = {"train": train_ds}
+    if eval_ds is not None:
+        out["eval"] = eval_ds
+    return out
+
+
+def _training_arguments_kwargs(
+    training_cfg: Dict[str, Any],
+    *,
+    output_dir: str,
+    has_eval: bool,
+    use_cuda: bool,
+) -> Dict[str, Any]:
+    if TrainingArguments is None:
+        return {}
+    params = inspect.signature(TrainingArguments.__init__).parameters
+    eval_strategy = training_cfg.get("evaluation_strategy", training_cfg.get("eval_strategy", "steps" if has_eval else "no"))
+    if not has_eval:
+        eval_strategy = "no"
+    save_strategy = training_cfg.get("save_strategy", "steps")
+    load_best_model = bool(has_eval and eval_strategy != "no" and training_cfg.get("load_best_model_at_end", False))
+
+    kwargs: Dict[str, Any] = {
+        "output_dir": output_dir,
+        "num_train_epochs": training_cfg.get("num_epochs", 1),
+        "max_steps": training_cfg.get("max_steps", -1),
+        "per_device_train_batch_size": training_cfg.get("batch_size", 1),
+        "gradient_accumulation_steps": training_cfg.get("gradient_accumulation_steps", 1),
+        "learning_rate": training_cfg.get("learning_rate", 5e-5),
+        "weight_decay": training_cfg.get("weight_decay", 0.0),
+        "warmup_steps": training_cfg.get("warmup_steps", 0),
+        "fp16": use_cuda and training_cfg.get("precision", "fp16") == "fp16",
+        "bf16": use_cuda and training_cfg.get("precision", "fp16") == "bf16",
+        "logging_steps": training_cfg.get("logging_steps", 50),
+        "save_steps": training_cfg.get("save_steps", 200),
+        "save_total_limit": 1,
+        "remove_unused_columns": False,
+        "report_to": [],
+        "no_cuda": not use_cuda,
+    }
+    if "evaluation_strategy" in params:
+        kwargs["evaluation_strategy"] = eval_strategy
+    elif "eval_strategy" in params:
+        kwargs["eval_strategy"] = eval_strategy
+    if "save_strategy" in params:
+        kwargs["save_strategy"] = save_strategy
+    if has_eval and eval_strategy != "no" and "eval_steps" in params:
+        kwargs["eval_steps"] = training_cfg.get("eval_steps", 200)
+    if "load_best_model_at_end" in params:
+        kwargs["load_best_model_at_end"] = load_best_model
+    if load_best_model and "metric_for_best_model" in params:
+        metric_name = training_cfg.get("metric_for_best_model")
+        if metric_name:
+            kwargs["metric_for_best_model"] = metric_name
+    return {key: value for key, value in kwargs.items() if key in params}
+
+
 def build_backbone(config: Dict[str, Any]):
     """Construct a backbone model per config; supports encoder/decoder/encoder_decoder."""
     backbone_cfg = config.get("backbone", {})
-    model_type = backbone_cfg.get("type")
+    model_type = _resolve_backbone_type(config)
     base_model = backbone_cfg.get("base_model")
     training_cfg = config.get("training", {})
-    from models.shared.archetypes import get_archetype
-    archetype = get_archetype(config.get("model_id", "")) or {}
-    # Prefer seq2seq head for certain generative IDs.
-    seq2seq_ids = {"A2", "P1", "P2", "P3", "P4", "R3", "R5", "C1"}
-    prefer_seq2seq = training_cfg.get("model_type") == "seq2seq" or config.get("model_id") in seq2seq_ids
+    prefer_seq2seq = _prefer_seq2seq_config(config)
     cache_dir = backbone_cfg.get("cache_dir")
     load_in_8bit = backbone_cfg.get("load_in_8bit", True)
     load_in_4bit = backbone_cfg.get("load_in_4bit", False)
@@ -156,17 +393,17 @@ def build_backbone(config: Dict[str, Any]):
     elif load_in_8bit:
         common_kwargs["load_in_8bit"] = True
 
-    # Default llama-family to causal LM even if type is mislabeled.
-    if model_type == "encoder" and "llama" in base_model.lower():
-        model_type = "decoder"
-
     # Optionally switch to classification head for classifier archetypes.
-    is_classifier = archetype.get("archetype") == "classifier" or training_cfg.get("model_type") == "classifier"
+    is_classifier = _is_classifier_config(config)
     num_labels = int(training_cfg.get("num_labels", 10))
 
     if model_type == "encoder":
-        AutoModel = _maybe_import("AutoModel")
-        model = _load(AutoModel, base_model, **common_kwargs)
+        if is_classifier:
+            AutoModelForSequenceClassification = _maybe_import("AutoModelForSequenceClassification")
+            model = _load(AutoModelForSequenceClassification, base_model, num_labels=num_labels, **common_kwargs)
+        else:
+            AutoModel = _maybe_import("AutoModel")
+            model = _load(AutoModel, base_model, **common_kwargs)
     elif model_type == "decoder":
         if is_classifier:
             AutoModelForSequenceClassification = _maybe_import("AutoModelForSequenceClassification")
@@ -228,15 +465,19 @@ def apply_peft_if_needed(model: Any, config: Dict[str, Any]) -> Any:
         peft = __import__("peft")
         get_peft_model = getattr(peft, "get_peft_model")
         LoraConfig = getattr(peft, "LoraConfig")
+        TaskType = getattr(peft, "TaskType", None)
     except Exception as exc:  # pragma: no cover - dependency optional
         raise ImportError(f"Missing PEFT dependency: {exc}")
+    task_type = _infer_peft_task_type(config)
+    if TaskType is not None and hasattr(TaskType, task_type):
+        task_type = getattr(TaskType, task_type)
     lora_cfg = LoraConfig(
         r=8,
         lora_alpha=32,
         target_modules=None,
         lora_dropout=0.05,
         bias="none",
-        task_type="CAUSAL_LM",
+        task_type=task_type,
     )
     return get_peft_model(model, lora_cfg)
 
@@ -257,6 +498,38 @@ class Trainer:
         self.tokenizer = tokenizer
         self.backbone = backbone
         self.label_to_id = {}
+
+    def _label_to_id(self, label: Any) -> int:
+        key = str(label or "unknown")
+        if key not in self.label_to_id:
+            self.label_to_id[key] = len(self.label_to_id)
+        return int(self.label_to_id[key])
+
+    def _move_to_device(self, batch: Any, device: str) -> Any:
+        if hasattr(batch, "to"):
+            return batch.to(device)
+        if isinstance(batch, dict):
+            return {k: (v.to(device) if hasattr(v, "to") else v) for k, v in batch.items()}
+        return batch
+
+    def _contrastive_collate(self, batch):
+        texts_a = []
+        texts_b = []
+        labels = []
+        for pair, label in batch:
+            if isinstance(pair, dict):
+                text_a = pair.get("text_a") or pair.get("text") or ""
+                text_b = pair.get("text_b") or ""
+            elif isinstance(pair, (list, tuple)) and len(pair) >= 2:
+                text_a = pair[0]
+                text_b = pair[1]
+            else:
+                text_a = pair
+                text_b = ""
+            texts_a.append(str(text_a or ""))
+            texts_b.append(str(text_b or ""))
+            labels.append(int(label))
+        return texts_a, texts_b, labels
 
     def _should_use_hf_trainer(self) -> bool:
         """Decide if we should attempt HF Trainer (CPU or CUDA)."""
@@ -331,156 +604,429 @@ class Trainer:
         if not data_files:
             return None
 
-        raw = load_dataset("json", data_files=data_files)
-        archetype = get_archetype(self.config.get("model_id", "")) or {}
-        archetype_name = archetype.get("archetype", "generative")
-        ds_quality = ds_cfg.get("quality_filters") or {}
-        ds_domains = set(ds_cfg.get("domains") or [])
-        training_cfg = self.config.get("training", {}) or {}
-        eval_split = float(training_cfg.get("eval_split", 0.0) or 0.0)
+        with _datasets_fingerprint_compatible_env():
+            raw = load_dataset("json", data_files=data_files)
+            archetype = get_archetype(self.config.get("model_id", "")) or {}
+            archetype_name = archetype.get("archetype", "generative")
+            ds_quality = ds_cfg.get("quality_filters") or {}
+            ds_domains = set(ds_cfg.get("domains") or [])
+            training_cfg = self.config.get("training", {}) or {}
+            eval_split = _resolve_eval_split(self.config)
 
-        # --- Quality filtering heuristics --------------------------------- #
+            # --- Quality filtering heuristics --------------------------------- #
 
-        def _len_bounds(kind: str) -> tuple[int, int]:
-            if kind == "repos":
-                return int(ds_quality.get("repos_min_chars", 64)), int(ds_quality.get("repos_max_chars", 65536))
-            if kind == "papers":
-                return int(ds_quality.get("papers_min_chars", 64)), int(ds_quality.get("papers_max_chars", 65536))
-            if kind == "pairs":
-                return int(ds_quality.get("pairs_min_chars", 64)), int(ds_quality.get("pairs_max_chars", 65536))
-            return 0, 10**9
+            def _len_bounds(kind: str) -> tuple[int, int]:
+                if kind == "repos":
+                    return int(ds_quality.get("repos_min_chars", 64)), int(ds_quality.get("repos_max_chars", 65536))
+                if kind == "papers":
+                    return int(ds_quality.get("papers_min_chars", 64)), int(ds_quality.get("papers_max_chars", 65536))
+                if kind == "pairs":
+                    return int(ds_quality.get("pairs_min_chars", 64)), int(ds_quality.get("pairs_max_chars", 65536))
+                return 0, 10**9
 
-        def _filter_repos(ex: Dict[str, Any]) -> bool:
-            text = str(ex.get("text") or "").strip()
-            mn, mx = _len_bounds("repos")
-            if not (mn <= len(text) <= mx):
-                return False
-            meta = ex.get("meta") or {}
-            path = str(meta.get("path") or "")
-            # Basic path-based noise filtering (virtualenvs, caches, etc.).
-            noisy_fragments = ds_quality.get(
-                "repos_exclude_path_fragments",
-                ["site-packages", ".venv", "__pycache__", "node_modules", "dist-packages"],
-            )
-            for frag in noisy_fragments:
-                if frag and frag in path:
+            def _filter_repos(ex: Dict[str, Any]) -> bool:
+                text = str(ex.get("text") or "").strip()
+                mn, mx = _len_bounds("repos")
+                if not (mn <= len(text) <= mx):
                     return False
-            return True
-
-        def _filter_papers(ex: Dict[str, Any]) -> bool:
-            text = str(ex.get("text") or "").strip()
-            mn, mx = _len_bounds("papers")
-            if not (mn <= len(text) <= mx):
-                return False
-            return True
-
-        def _filter_pairs(ex: Dict[str, Any]) -> bool:
-            paper = str(ex.get("paper_text") or "").strip()
-            repo = str(ex.get("repo_text") or "").strip()
-            mn, mx = _len_bounds("pairs")
-            total_len = len(paper) + len(repo)
-            if not paper or not repo:
-                return False
-            if not (mn <= total_len <= mx):
-                return False
-            return True
-
-        if "repos" in raw:
-            raw["repos"] = raw["repos"].filter(_filter_repos)
-        if "papers" in raw:
-            raw["papers"] = raw["papers"].filter(_filter_papers)
-        if "pairs" in raw:
-            raw["pairs"] = raw["pairs"].filter(_filter_pairs)
-
-        # --- Domain-level filtering ---------------------------------------- #
-
-        if ds_domains:
-            def _has_domain(ex: Dict[str, Any]) -> bool:
                 meta = ex.get("meta") or {}
-                doms = meta.get("domains") or []
-                if isinstance(doms, str):
-                    doms_list = [doms]
-                else:
-                    try:
-                        doms_list = list(doms)
-                    except Exception:
-                        doms_list = []
-                return any(d in ds_domains for d in doms_list)
+                path = str(meta.get("path") or "")
+                # Basic path-based noise filtering (virtualenvs, caches, etc.).
+                noisy_fragments = ds_quality.get(
+                    "repos_exclude_path_fragments",
+                    ["site-packages", ".venv", "__pycache__", "node_modules", "dist-packages"],
+                )
+                for frag in noisy_fragments:
+                    if frag and frag in path:
+                        return False
+                return True
+
+            def _filter_papers(ex: Dict[str, Any]) -> bool:
+                text = str(ex.get("text") or "").strip()
+                mn, mx = _len_bounds("papers")
+                if not (mn <= len(text) <= mx):
+                    return False
+                return True
+
+            def _filter_pairs(ex: Dict[str, Any]) -> bool:
+                paper = str(ex.get("paper_text") or "").strip()
+                repo = str(ex.get("repo_text") or "").strip()
+                mn, mx = _len_bounds("pairs")
+                total_len = len(paper) + len(repo)
+                if not paper or not repo:
+                    return False
+                if not (mn <= total_len <= mx):
+                    return False
+                return True
 
             if "repos" in raw:
-                raw["repos"] = raw["repos"].filter(_has_domain)
+                raw["repos"] = raw["repos"].filter(_filter_repos)
             if "papers" in raw:
-                raw["papers"] = raw["papers"].filter(_has_domain)
+                raw["papers"] = raw["papers"].filter(_filter_papers)
             if "pairs" in raw:
-                raw["pairs"] = raw["pairs"].filter(_has_domain)
+                raw["pairs"] = raw["pairs"].filter(_filter_pairs)
 
-        # --- Static corpus mixing / re-weighting -------------------------- #
+            # --- Domain-level filtering ---------------------------------------- #
 
-        mix_cfg = ds_cfg.get("corpus_mix") or {}
-        if mix_cfg and any(k in raw for k in ("repos", "papers")) and archetype_name != "contrastive":
+            if ds_domains:
+                def _has_domain(ex: Dict[str, Any]) -> bool:
+                    meta = ex.get("meta") or {}
+                    doms = meta.get("domains") or []
+                    if isinstance(doms, str):
+                        doms_list = [doms]
+                    else:
+                        try:
+                            doms_list = list(doms)
+                        except Exception:
+                            doms_list = []
+                    return any(d in ds_domains for d in doms_list)
+
+                if "repos" in raw:
+                    raw["repos"] = raw["repos"].filter(_has_domain)
+                if "papers" in raw:
+                    raw["papers"] = raw["papers"].filter(_has_domain)
+                if "pairs" in raw:
+                    raw["pairs"] = raw["pairs"].filter(_has_domain)
+
+            # --- Static corpus mixing / re-weighting -------------------------- #
+
+            mix_cfg = ds_cfg.get("corpus_mix") or {}
+            if mix_cfg and any(k in raw for k in ("repos", "papers")) and archetype_name != "contrastive":
+                parts = []
+
+                def _reweight(split_name: str, ds_split):
+                    weight = float(mix_cfg.get(split_name, 1.0))
+                    if weight <= 0.0:
+                        return None
+                    # For weight < 1.0, subsample; for >1.0, oversample up to 3x.
+                    n = len(ds_split)
+                    if n == 0:
+                        return None
+                    target = int(max(1, min(n * max(weight, 0.0), n * 3.0)))
+                    if target == n:
+                        return ds_split
+                    return ds_split.shuffle(seed=int(training_cfg.get("shuffle_seed", 42))).select(range(target))
+
+                if "repos" in raw:
+                    ds_r = _reweight("repos", raw["repos"])
+                    if ds_r is not None:
+                        raw["repos"] = ds_r
+                if "papers" in raw:
+                    ds_p = _reweight("papers", raw["papers"])
+                    if ds_p is not None:
+                        raw["papers"] = ds_p
+
+            # Contrastive models (e.g., C2/C6) should train only on pair records.
+            if archetype_name == "contrastive" and "pairs" in raw:
+                base = raw["pairs"]
+                if eval_split > 0.0:
+                    return _normalize_dataset_splits(base.train_test_split(test_size=eval_split))
+                return base
+
+            # Generative/classifier models: mix repo and paper corpora if available.
             parts = []
-
-            def _reweight(split_name: str, ds_split):
-                weight = float(mix_cfg.get(split_name, 1.0))
-                if weight <= 0.0:
-                    return None
-                # For weight < 1.0, subsample; for >1.0, oversample up to 3x.
-                n = len(ds_split)
-                if n == 0:
-                    return None
-                target = int(max(1, min(n * max(weight, 0.0), n * 3.0)))
-                if target == n:
-                    return ds_split
-                return ds_split.shuffle(seed=int(training_cfg.get("shuffle_seed", 42))).select(range(target))
-
             if "repos" in raw:
-                ds_r = _reweight("repos", raw["repos"])
-                if ds_r is not None:
-                    raw["repos"] = ds_r
+                parts.append(raw["repos"])
             if "papers" in raw:
-                ds_p = _reweight("papers", raw["papers"])
-                if ds_p is not None:
-                    raw["papers"] = ds_p
-
-        # Contrastive models (e.g., C2/C6) should train only on pair records.
-        if archetype_name == "contrastive" and "pairs" in raw:
-            base = raw["pairs"]
+                parts.append(raw["papers"])
+            if not parts:
+                return None
+            mixed = parts[0] if len(parts) == 1 or concatenate_datasets is None else concatenate_datasets(parts)
             if eval_split > 0.0:
-                return base.train_test_split(test_size=eval_split)
-            return base
+                return _normalize_dataset_splits(mixed.train_test_split(test_size=eval_split))
+            return mixed
 
-        # Generative/classifier models: mix repo and paper corpora if available.
-        parts = []
-        if "repos" in raw:
-            parts.append(raw["repos"])
-        if "papers" in raw:
-            parts.append(raw["papers"])
-        if not parts:
+    def _build_paper_text_hf_dataset(self):
+        """
+        Build an HF Dataset directly from the parquet-backed paper-text corpus.
+
+        This avoids materializing large Python lists for paper-only models like
+        P1/C3 and keeps the Arrow/parquet path available for abstract and
+        metadata style models over the same paper rows.
+        """
+        if load_dataset is None or HFDataset is None:
             return None
-        mixed = parts[0] if len(parts) == 1 or concatenate_datasets is None else concatenate_datasets(parts)
-        if eval_split > 0.0:
-            return mixed.train_test_split(test_size=eval_split)
-        return mixed
+
+        ds_cfg = self.config.get("dataset", {}) or {}
+        sources = ds_cfg.get("sources") or []
+        if "paper_text_parquet" not in sources:
+            return None
+
+        construction = ds_cfg.get("construction") or {}
+        dataset_dir = construction.get("paper_dataset_dir") or "/arxiv/huggingface/paper_text_1m_dedup_v1"
+        parquet_paths = _paper_parquet_paths(dataset_dir)
+        if not parquet_paths:
+            return None
+
+        with _datasets_fingerprint_compatible_env():
+            raw = load_dataset("parquet", data_files=[str(p) for p in parquet_paths], split="train")
+            filters = ds_cfg.get("filters") or {}
+            years_filter = filters.get("years")
+            categories_filter = set(filters.get("categories") or [])
+            ds_quality = ds_cfg.get("quality_filters") or {}
+            archetype = get_archetype(self.config.get("model_id", "")) or {}
+            archetype_name = archetype.get("archetype", "generative")
+            model_id = self.config.get("model_id", "")
+            training_cfg = self.config.get("training", {}) or {}
+            eval_split = _resolve_eval_split(self.config)
+            max_samples = int(construction.get("max_samples", 0) or 0)
+            shuffle_seed = int(training_cfg.get("shuffle_seed", construction.get("shuffling_seed", 42)))
+            prefer_seq2seq = _prefer_seq2seq_config(self.config)
+
+            def _match_filters(ex: Dict[str, Any]) -> bool:
+                normalized = _normalize_paper_row(ex)
+                if years_filter and len(years_filter) == 2:
+                    year = _paper_row_year(normalized)
+                    if year is not None and not (int(years_filter[0]) <= year <= int(years_filter[1])):
+                        return False
+                if categories_filter:
+                    categories = normalized.get("categories") or normalized.get("primary_category") or ""
+                    if not any(cat in str(categories) for cat in categories_filter):
+                        return False
+                if model_id in {"P1", "C3", "M6", "M7"}:
+                    text = str(normalized.get("text") or "").strip()
+                    if not text:
+                        return False
+                    min_chars = int(ds_quality.get("papers_min_chars", 256))
+                    max_chars = int(ds_quality.get("papers_max_chars", 131072))
+                    text_len = int(normalized.get("text_char_count") or len(text))
+                    if not (min_chars <= text_len <= max_chars):
+                        return False
+                else:
+                    title = str(normalized.get("title") or "").strip()
+                    abstract = str(normalized.get("abstract") or "").strip()
+                    if not title and not abstract:
+                        return False
+                if ds_quality.get("require_full_text", False) and bool(normalized.get("text_is_partial")):
+                    return False
+                return True
+
+            raw = raw.filter(_match_filters)
+            if len(raw) == 0:
+                return None
+
+            raw = raw.shuffle(seed=shuffle_seed)
+            if max_samples > 0:
+                raw = raw.select(range(min(max_samples, len(raw))))
+            remove_columns = list(raw.features)
+
+            def _map_classifier(batch: Dict[str, Any]) -> Dict[str, Any]:
+                texts = []
+                labels = []
+                size = len(next(iter(batch.values()))) if batch else 0
+                for idx in range(size):
+                    row = _normalize_paper_row({k: batch[k][idx] for k in batch})
+                    texts.append(_format_text_from_entry(row))
+                    labels.append(str(row.get("primary_category") or row.get("categories") or "unknown"))
+                return {"text": texts, "label": labels}
+
+            def _map_method_summary(batch: Dict[str, Any]) -> Dict[str, Any]:
+                texts = []
+                targets = []
+                size = len(next(iter(batch.values()))) if batch else 0
+                for idx in range(size):
+                    row = _normalize_paper_row({k: batch[k][idx] for k in batch})
+                    texts.append(str(row.get("abstract") or "").strip() or _format_text_from_entry(row))
+                    targets.append(_paper_method_summary_target(row))
+                return {"text": texts, "target": targets}
+
+            def _map_keywords(batch: Dict[str, Any]) -> Dict[str, Any]:
+                texts = []
+                targets = []
+                size = len(next(iter(batch.values()))) if batch else 0
+                for idx in range(size):
+                    row = _normalize_paper_row({k: batch[k][idx] for k in batch})
+                    texts.append(str(row.get("abstract") or "").strip() or _format_text_from_entry(row))
+                    targets.append(_paper_keyword_target(row))
+                return {"text": texts, "target": targets}
+
+            def _map_paper_qa(batch: Dict[str, Any]) -> Dict[str, Any]:
+                size = len(next(iter(batch.values()))) if batch else 0
+                rows = []
+                for idx in range(size):
+                    rows.append(_normalize_paper_row({k: batch[k][idx] for k in batch}))
+                samples = _build_paper_qa_samples(rows, max_samples=max(1, size * 3))
+                return {
+                    "question": [sample["question"] for sample in samples],
+                    "context": [sample["context"] for sample in samples],
+                    "target": [sample["target"] for sample in samples],
+                    "paper_id": [sample.get("paper_id") for sample in samples],
+                    "pdf_path": [sample.get("pdf_path") for sample in samples],
+                }
+
+            def _map_fulltext(batch: Dict[str, Any]) -> Dict[str, Any]:
+                samples = []
+                chunk_chars = int(construction.get("chunk_chars_text", construction.get("chunk_chars_pdf", 8000)) or 8000)
+                chunk_overlap = int(construction.get("chunk_overlap_text", construction.get("chunk_overlap_pdf", 400)) or 400)
+                size = len(next(iter(batch.values()))) if batch else 0
+                rows = []
+                for idx in range(size):
+                    rows.append(_normalize_paper_row({k: batch[k][idx] for k in batch}))
+                samples = _build_fulltext_samples(
+                    rows,
+                    max_samples=max(1, size * 64),
+                    chunk_chars=chunk_chars,
+                    overlap=chunk_overlap,
+                    target_mode="next_chunk" if model_id == "P1" and prefer_seq2seq else "none",
+                )
+                result = {
+                    "text": [sample["text"] for sample in samples],
+                    "paper_id": [sample.get("paper_id") for sample in samples],
+                    "pdf_path": [sample.get("pdf_path") for sample in samples],
+                    "offset": [sample.get("offset") for sample in samples],
+                }
+                if any(sample.get("target") is not None for sample in samples):
+                    result["target"] = [sample.get("target") for sample in samples]
+                return result
+
+            def _map_contrastive(batch: Dict[str, Any]) -> Dict[str, Any]:
+                size = len(next(iter(batch.values()))) if batch else 0
+                rows = []
+                for idx in range(size):
+                    rows.append(_normalize_paper_row({k: batch[k][idx] for k in batch}))
+                chunk_chars = int(construction.get("chunk_chars_text", construction.get("chunk_chars_pdf", 8000)) or 8000)
+                chunk_overlap = int(construction.get("chunk_overlap_text", construction.get("chunk_overlap_pdf", 400)) or 400)
+                if model_id == "M6":
+                    pairs = _build_paper_fulltext_embedding_samples(
+                        rows,
+                        max_samples=max(1, size * 8),
+                        chunk_chars=chunk_chars,
+                        overlap=chunk_overlap,
+                        max_chunks_per_paper=int(construction.get("max_chunks_per_paper", 2) or 2),
+                        document_chars=int(construction.get("document_chars", 6000) or 6000),
+                    )
+                elif model_id == "M7":
+                    pairs = _build_paper_sentence_embedding_samples(
+                        rows,
+                        max_samples=max(1, size * 6),
+                        max_query_sentences=int(construction.get("max_query_sentences", 3) or 3),
+                        max_body_sentences=int(construction.get("max_body_sentences", 16) or 16),
+                    )
+                elif model_id == "M1":
+                    pairs = _build_metadata_embedding_samples(rows, max_samples=max(1, size * 4))
+                else:
+                    pairs = _build_paper_retrieval_samples(
+                        rows,
+                        max_samples=max(1, size * 6),
+                        chunk_chars=chunk_chars,
+                        overlap=chunk_overlap,
+                    )
+                return {
+                    "text_a": [sample["text_a"] for sample in pairs],
+                    "text_b": [sample["text_b"] for sample in pairs],
+                    "label": [sample["label"] for sample in pairs],
+                    "paper_id": [sample.get("paper_id") for sample in pairs],
+                }
+
+            if archetype_name == "contrastive":
+                processed = raw.map(_map_contrastive, batched=True, batch_size=1024, remove_columns=remove_columns)
+            elif archetype_name == "classifier":
+                processed = raw.map(_map_classifier, batched=True, batch_size=1024, remove_columns=remove_columns)
+            elif model_id == "A2":
+                processed = raw.map(_map_method_summary, batched=True, batch_size=256, remove_columns=remove_columns)
+            elif model_id == "A3":
+                processed = raw.map(_map_keywords, batched=True, batch_size=256, remove_columns=remove_columns)
+            elif model_id == "P5":
+                processed = raw.map(_map_paper_qa, batched=True, batch_size=128, remove_columns=remove_columns)
+            elif model_id in {"P1", "C3"}:
+                processed = raw.map(_map_fulltext, batched=True, batch_size=64, remove_columns=remove_columns)
+            else:
+                return None
+
+            if len(processed) == 0:
+                return None
+            if archetype_name == "contrastive" and "paper_id" in processed.features:
+                processed = self._augment_dataset_with_teacher_embeddings(processed, construction)
+            if eval_split > 0.0:
+                return _normalize_dataset_splits(processed.train_test_split(test_size=eval_split))
+            return processed
+
+    def _augment_dataset_with_teacher_embeddings(self, dataset: Any, construction: Dict[str, Any]):
+        if HFDataset is None or dataset is None:
+            return dataset
+        feature_names = set(getattr(dataset, "column_names", []) or [])
+        if not feature_names and getattr(dataset, "features", None) is not None:
+            try:
+                feature_names = set(dataset.features.keys())
+            except Exception:
+                feature_names = set()
+        if "paper_id" not in feature_names:
+            return dataset
+        training_cfg = self.config.get("training", {}) or {}
+        if float(training_cfg.get("distillation_weight", 0.0) or 0.0) <= 0.0:
+            return dataset
+        try:
+            paper_ids = {
+                str(paper_id or "").strip()
+                for paper_id in dataset["paper_id"]
+                if str(paper_id or "").strip()
+            }
+        except Exception:
+            return dataset
+        lookup = _load_teacher_embedding_lookup(paper_ids, construction)
+        if not lookup:
+            return dataset
+        default_embedding = [0.0 for _ in range(len(next(iter(lookup.values()))))]
+
+        def _attach(batch: Dict[str, Any]) -> Dict[str, Any]:
+            embeddings = []
+            masks = []
+            for paper_id in batch.get("paper_id") or []:
+                key = str(paper_id or "").strip()
+                teacher = lookup.get(key)
+                embeddings.append(list(teacher) if teacher is not None else list(default_embedding))
+                masks.append(1 if teacher is not None else 0)
+            return {"teacher_embedding": embeddings, "teacher_mask": masks}
+
+        return dataset.map(_attach, batched=True, batch_size=1024)
+
+    def _maybe_prepare_teacher_projection(self, train_ds: Any) -> None:
+        if torch is None or self.backbone is None or train_ds is None:
+            return
+        training_cfg = self.config.get("training", {}) or {}
+        if float(training_cfg.get("distillation_weight", 0.0) or 0.0) <= 0.0:
+            return
+        sample = None
+        try:
+            if len(train_ds) > 0:
+                sample = train_ds[0]
+        except Exception:
+            sample = None
+        teacher_embedding = sample.get("teacher_embedding") if isinstance(sample, dict) else None
+        if not isinstance(teacher_embedding, list) or not teacher_embedding:
+            return
+        teacher_dim = int(len(teacher_embedding))
+        cfg = getattr(self.backbone, "config", None)
+        hidden_size = getattr(cfg, "hidden_size", None) or getattr(cfg, "d_model", None)
+        if not hidden_size:
+            return
+        if teacher_dim != int(hidden_size) and not hasattr(self.backbone, "teacher_projection"):
+            self.backbone.add_module(
+                "teacher_projection",
+                torch.nn.Linear(int(hidden_size), teacher_dim, bias=False),
+            )
 
     def _build_hf_dataset(self):
         # Prefer full-corpus HF datasets when corpus_* sources are configured.
         corpus_ds = self._build_corpus_hf_dataset()
         if corpus_ds is not None:
             return corpus_ds
+        paper_ds = self._build_paper_text_hf_dataset()
+        if paper_ds is not None:
+            return paper_ds
 
         dataset = build_dataset(self.config)
         if not dataset:
             return None
-        training_cfg = self.config.get("training", {})
-        eval_split = float(training_cfg.get("eval_split", 0.1) or 0.0)
+        eval_split = _resolve_eval_split(self.config)
         if eval_split > 0 and len(dataset) > 4:
             cut = max(1, int(len(dataset) * eval_split))
             eval_list = dataset[:cut]
             train_list = dataset[cut:]
-            return {
+            return _normalize_dataset_splits({
                 "train": HFDataset.from_list(train_list),
                 "eval": HFDataset.from_list(eval_list),
-            }
+            })
         return HFDataset.from_list(dataset)
 
     def _mean_pool(self, hidden_states):
@@ -530,17 +1076,21 @@ class Trainer:
             def __getitem__(self, idx):
                 return pairs[idx], labels[idx]
 
-        dl = DataLoader(ContrastiveDataset(), batch_size=batch_size, shuffle=True)
+        dl = DataLoader(ContrastiveDataset(), batch_size=batch_size, shuffle=True, collate_fn=self._contrastive_collate)
         steps = 0
         self.backbone.train()
         for batch in dl:
             if steps >= max_steps:
                 break
-            (text_pairs, lbls) = batch
-            texts_a = [p[0] for p in text_pairs]
-            texts_b = [p[1] for p in text_pairs]
-            enc_a = self.tokenizer(texts_a, padding=True, truncation=True, max_length=256, return_tensors="pt").to(device)
-            enc_b = self.tokenizer(texts_b, padding=True, truncation=True, max_length=256, return_tensors="pt").to(device)
+            texts_a, texts_b, lbls = batch
+            enc_a = self._move_to_device(
+                self.tokenizer(texts_a, padding=True, truncation=True, max_length=256, return_tensors="pt"),
+                device,
+            )
+            enc_b = self._move_to_device(
+                self.tokenizer(texts_b, padding=True, truncation=True, max_length=256, return_tensors="pt"),
+                device,
+            )
             out_a = self.backbone(**enc_a)
             out_b = self.backbone(**enc_b)
             hidden_a = out_a.last_hidden_state if hasattr(out_a, "last_hidden_state") else None
@@ -559,11 +1109,12 @@ class Trainer:
 
     def _tokenize_fn(self, examples: Dict[str, Any]):
         tok_cfg = self.config.get("dataset", {}).get("tokenization", {})
-        max_src = tok_cfg.get("max_source_tokens", 2048)
+        max_src = _effective_source_token_limit(self.config, tokenizer=self.tokenizer, backbone=self.backbone)
         training_cfg = self.config.get("training", {})
         archetype = get_archetype(self.config.get("model_id", "")) or {}
         objective = training_cfg.get("objective")
-        prefer_seq2seq = training_cfg.get("model_type") == "seq2seq" or self.config.get("model_id") in {"A2", "P1", "P2", "P3", "P4", "R3", "R5", "C1"}
+        prefer_seq2seq = _prefer_seq2seq_config(self.config)
+        classifier_like = _is_classifier_config(self.config) or archetype.get("archetype") == "graph" or objective == "link_prediction"
         text = examples.get("text", "")
         tokens = examples.get("tokens")
         if (not text) and tokens:
@@ -603,6 +1154,12 @@ class Trainer:
             enc_b = {f"{k}_b": v for k, v in enc_b.items()}
             enc_a.update(enc_b)
             enc_a["labels"] = int(label) if label is not None else 0
+            teacher_embedding = examples.get("teacher_embedding")
+            teacher_mask = examples.get("teacher_mask")
+            if teacher_embedding is not None:
+                enc_a["teacher_embedding"] = teacher_embedding
+            if teacher_mask is not None:
+                enc_a["teacher_mask"] = int(teacher_mask)
             return enc_a
 
         # Otherwise, single prompt path (seq2seq or decoder LM)
@@ -620,27 +1177,32 @@ class Trainer:
                 prompt += f"CONTEXT:\n{context}\n"
             if text:
                 prompt += f"TEXT:\n{text}\n"
-            if target:
+            if target and not prefer_seq2seq:
                 prompt += f"TARGET:\n{target}"
 
-        if target:
+        if target is not None and not prefer_seq2seq:
             prompt = f"INPUT:\n{prompt}\nTARGET:\n{target}"
 
         if prefer_seq2seq and target is not None:
-            model_inputs = self.tokenizer(
-                prompt,
-                truncation=True,
-                max_length=max_src,
-                padding="max_length",
-            )
-            with self.tokenizer.as_target_tokenizer():
-                labels = self.tokenizer(
-                    str(target),
+            target_kwargs = {"truncation": True, "max_length": tok_cfg.get("max_target_tokens", 512), "padding": "max_length"}
+            try:
+                model_inputs = self.tokenizer(
+                    prompt,
                     truncation=True,
-                    max_length=tok_cfg.get("max_target_tokens", 512),
+                    max_length=max_src,
                     padding="max_length",
-                )["input_ids"]
-            model_inputs["labels"] = labels
+                )
+                target_inputs = self.tokenizer(text_target=str(target), **target_kwargs)
+                model_inputs["labels"] = target_inputs["input_ids"]
+            except TypeError:
+                model_inputs = self.tokenizer(
+                    prompt,
+                    truncation=True,
+                    max_length=max_src,
+                    padding="max_length",
+                )
+                with self.tokenizer.as_target_tokenizer():
+                    model_inputs["labels"] = self.tokenizer(str(target), **target_kwargs)["input_ids"]
             return model_inputs
 
         encoded = self.tokenizer(
@@ -650,7 +1212,7 @@ class Trainer:
             padding="max_length",
         )
         # Labels handling
-        if objective == "cross_entropy" and archetype.get("archetype") == "classifier":
+        if classifier_like:
             if isinstance(label, str):
                 # Map string labels to ids
                 label_id = self._label_to_id(label)
@@ -677,6 +1239,7 @@ class Trainer:
         ds = self._build_hf_dataset()
         if ds is None:
             return False
+        ds = _normalize_dataset_splits(ds)
         has_eval = isinstance(ds, dict)
         train_ds = ds["train"] if has_eval else ds
         eval_ds = ds["eval"] if has_eval else None
@@ -691,7 +1254,11 @@ class Trainer:
                     labels.add(str(ex["label"]))
             self.label_to_id = {lbl: idx for idx, lbl in enumerate(sorted(labels))}
             training_cfg["num_labels"] = max(len(self.label_to_id), 2)
+            if self.backbone is not None and getattr(self.backbone, "config", None) is not None:
+                self.backbone.config.label2id = dict(self.label_to_id)
+                self.backbone.config.id2label = {idx: lbl for lbl, idx in self.label_to_id.items()}
 
+        self._maybe_prepare_teacher_projection(train_ds)
         tokenized_train = train_ds.map(self._tokenize_fn, remove_columns=list(train_ds.features))
         tokenized_eval = None
         if eval_ds is not None:
@@ -711,28 +1278,13 @@ class Trainer:
             os.makedirs(out_dir, exist_ok=True)
         force_cpu = training_cfg.get("force_cpu", False)
         use_cuda = torch is not None and torch.cuda.is_available() and not force_cpu
-        use_cuda = torch is not None and torch.cuda.is_available() and not force_cpu
         args = TrainingArguments(
-            output_dir=out_dir,
-            num_train_epochs=training_cfg.get("num_epochs", 1),
-            max_steps=training_cfg.get("max_steps", -1),
-            per_device_train_batch_size=training_cfg.get("batch_size", 1),
-            gradient_accumulation_steps=training_cfg.get("gradient_accumulation_steps", 1),
-            learning_rate=training_cfg.get("learning_rate", 5e-5),
-            weight_decay=training_cfg.get("weight_decay", 0.0),
-            warmup_steps=training_cfg.get("warmup_steps", 0),
-            fp16=use_cuda and training_cfg.get("precision", "fp16") == "fp16",
-            bf16=use_cuda and training_cfg.get("precision", "fp16") == "bf16",
-            logging_steps=training_cfg.get("logging_steps", 50),
-            save_steps=training_cfg.get("save_steps", 200),
-            save_total_limit=1,
-            remove_unused_columns=False,
-            report_to=[],
-            no_cuda=not use_cuda,
-            evaluation_strategy=training_cfg.get("evaluation_strategy", "steps" if has_eval else "no"),
-            eval_steps=training_cfg.get("eval_steps", 200),
-            load_best_model_at_end=training_cfg.get("load_best_model_at_end", False),
-            metric_for_best_model=training_cfg.get("metric_for_best_model", None),
+            **_training_arguments_kwargs(
+                training_cfg,
+                output_dir=out_dir,
+                has_eval=bool(tokenized_eval is not None),
+                use_cuda=use_cuda,
+            )
         )
         # Choose trainer
         if archetype.get("archetype") == "contrastive":
@@ -740,8 +1292,25 @@ class Trainer:
                 return False
 
             class ContrastiveTrainer(HFTrainer):
-                def compute_loss(self, model, inputs, return_outputs=False):
+                @staticmethod
+                def _clone_eval_value(value):
+                    if hasattr(value, "clone"):
+                        try:
+                            return value.clone()
+                        except Exception:
+                            return value
+                    if isinstance(value, list):
+                        return list(value)
+                    if isinstance(value, tuple):
+                        return tuple(value)
+                    if isinstance(value, dict):
+                        return dict(value)
+                    return value
+
+                def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
                     labels = inputs.pop("labels")
+                    teacher_embedding = inputs.pop("teacher_embedding", None)
+                    teacher_mask = inputs.pop("teacher_mask", None)
                     # Split inputs
                     def split_inputs(prefix):
                         return {
@@ -766,7 +1335,52 @@ class Trainer:
                     margin = training_cfg.get("contrastive_margin", 0.2)
                     neg = torch.clamp(sims - margin, min=0.0) * (1 - lbl)
                     loss = (pos + neg).mean()
+                    distillation_weight = float(training_cfg.get("distillation_weight", 0.0) or 0.0)
+                    if (
+                        distillation_weight > 0.0
+                        and teacher_embedding is not None
+                        and teacher_mask is not None
+                    ):
+                        teacher = teacher_embedding.to(pooled_b.device).float()
+                        teacher_active = teacher_mask.to(pooled_b.device).float().view(-1)
+                        if teacher.ndim == 2 and teacher.shape[-1] > 0 and torch.count_nonzero(teacher_active) > 0:
+                            student_teacher = pooled_b
+                            teacher_projection = getattr(model, "teacher_projection", None)
+                            if teacher_projection is not None:
+                                student_teacher = teacher_projection(student_teacher)
+                            student_teacher = F.normalize(student_teacher, dim=-1)
+                            teacher = F.normalize(teacher, dim=-1)
+                            distill_loss = 1 - (student_teacher * teacher).sum(dim=-1)
+                            distill_loss = (distill_loss * teacher_active).sum() / teacher_active.sum().clamp_min(1.0)
+                            loss = loss + (distillation_weight * distill_loss)
                     return (loss, (out_a, out_b)) if return_outputs else loss
+
+                def prediction_step(
+                    self,
+                    model,
+                    inputs,
+                    prediction_loss_only,
+                    ignore_keys=None,
+                ):
+                    eval_inputs = {
+                        key: self._clone_eval_value(value)
+                        for key, value in inputs.items()
+                    }
+                    with torch.no_grad():
+                        loss = self.compute_loss(
+                            model,
+                            eval_inputs,
+                            return_outputs=False,
+                        )
+                    if not hasattr(loss, "detach"):
+                        return (loss, None, None)
+                    loss = loss.detach()
+                    if prediction_loss_only:
+                        return (loss, None, None)
+                    labels = inputs.get("labels")
+                    if hasattr(labels, "detach"):
+                        labels = labels.detach()
+                    return (loss, None, labels)
 
             trainer = ContrastiveTrainer(
                 model=self.backbone,
@@ -774,6 +1388,7 @@ class Trainer:
                 train_dataset=tokenized_train,
                 tokenizer=self.tokenizer,
                 data_collator=default_data_collator,
+                eval_dataset=tokenized_eval,
             )
         else:
             trainer_kwargs = {
@@ -793,9 +1408,12 @@ class Trainer:
         """Mock train loop to keep CLI end-to-end runnable."""
         archetype = get_archetype(self.config.get("model_id", "")) or {}
         training_cfg = self.config.get("training", {}) or {}
+        use_hf_trainer = self._should_use_hf_trainer()
 
-        # Prefer contrastive loop for contrastive archetypes.
-        if archetype.get("archetype") == "contrastive":
+        # Prefer HF Trainer when configured so Arrow-backed datasets and eval
+        # splits are used. Fall back to the lightweight contrastive loop if
+        # trainer initialization or runtime fails.
+        if archetype.get("archetype") == "contrastive" and not use_hf_trainer:
             try:
                 if self._contrastive_train():
                     print("[train] completed contrastive loop.")
@@ -808,7 +1426,7 @@ class Trainer:
         # dataset.corpus_mix and basic training knobs (e.g., max_steps)
         # per phase while reusing the same backbone/checkpoints.
         curriculum = training_cfg.get("curriculum") or []
-        if self._should_use_hf_trainer() and curriculum:
+        if use_hf_trainer and curriculum:
             ds_cfg = self.config.setdefault("dataset", {})
             orig_mix = dict(ds_cfg.get("corpus_mix") or {})
             orig_max_steps = training_cfg.get("max_steps", -1)
@@ -833,13 +1451,25 @@ class Trainer:
             training_cfg["max_steps"] = orig_max_steps
             return None
 
-        if self._should_use_hf_trainer():
+        if use_hf_trainer:
             try:
                 if self._train_with_hf_trainer():
                     print("[train] completed via HF Trainer.")
                     return None
             except Exception as exc:  # pragma: no cover - fallback
                 print(f"[warn] HF Trainer path failed, falling back to mock: {exc}")
+                if not training_cfg.get("allow_mock_fallback", False):
+                    raise RuntimeError(
+                        "HF Trainer failed and mock fallback is disabled for this run. "
+                        "Set training.allow_mock_fallback=true only if you explicitly want a dry-run style fallback."
+                    ) from exc
+        if archetype.get("archetype") == "contrastive":
+            try:
+                if self._contrastive_train():
+                    print("[train] completed contrastive loop.")
+                    return None
+            except Exception as exc:
+                print(f"[warn] contrastive loop failed after trainer fallback: {exc}")
         dataset = build_dataset(self.config)
         print(
             f"[train] strategy={self.strategy} samples={len(dataset)} "

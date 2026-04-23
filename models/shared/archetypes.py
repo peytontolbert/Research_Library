@@ -10,10 +10,12 @@ ARCHETYPES = {
     "M3": {"archetype": "graph", "objective": "link_prediction"},
     "M4": {"archetype": "graph", "objective": "link_prediction"},
     "M5": {"archetype": "contrastive", "objective": "contrastive"},
+    "M6": {"archetype": "contrastive", "objective": "contrastive"},
+    "M7": {"archetype": "contrastive", "objective": "contrastive"},
     # Tier 2
     "A1": {"archetype": "contrastive", "objective": "contrastive"},
     "A2": {"archetype": "generative", "objective": "cross_entropy"},
-    "A3": {"archetype": "classifier", "objective": "cross_entropy"},
+    "A3": {"archetype": "generative", "objective": "cross_entropy"},
     "A4": {"archetype": "classifier", "objective": "cross_entropy"},
     # Tier 3
     "P0": {"archetype": "generative", "objective": "cross_entropy"},
@@ -21,6 +23,7 @@ ARCHETYPES = {
     "P2": {"archetype": "generative", "objective": "cross_entropy"},
     "P3": {"archetype": "generative", "objective": "cross_entropy"},
     "P4": {"archetype": "generative", "objective": "cross_entropy"},
+    "P5": {"archetype": "generative", "objective": "cross_entropy"},
     # Tier 4
     "R1": {"archetype": "contrastive", "objective": "contrastive"},
     "R2": {"archetype": "contrastive", "objective": "contrastive"},

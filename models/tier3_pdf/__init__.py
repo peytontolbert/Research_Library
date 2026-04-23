@@ -8,4 +8,5 @@ __all__ = [
     "section_to_algorithm",
     "equation_reasoning",
     "figure_table_interpretation",
+    "paper_qa",
 ]
