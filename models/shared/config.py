@@ -53,6 +53,7 @@ def ensure_runtime_cache_env(
 def validate_cache_dirs(config: dict, default_cache: str = "/data/checkpoints") -> dict:
     """Ensure cache/checkpoint dirs are set; fill defaults if missing."""
     ensure_runtime_cache_env()
+    cache_override = os.environ.get("RESEARCH_LIBRARY_CACHE_DIR")
     config.setdefault("training", {})
     config.setdefault("dataset", {})
     config.setdefault("backbone", {})
@@ -60,4 +61,8 @@ def validate_cache_dirs(config: dict, default_cache: str = "/data/checkpoints") 
     config["training"].setdefault("checkpoint_dir", default_cache)
     config["dataset"].setdefault("cache_dir", default_cache)
     config["backbone"].setdefault("cache_dir", default_cache)
+    if cache_override:
+        config["training"]["cache_dir"] = cache_override
+        config["dataset"]["cache_dir"] = cache_override
+        config["backbone"]["cache_dir"] = cache_override
     return config

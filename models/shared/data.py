@@ -671,12 +671,33 @@ _KEYWORD_STOPWORDS = {
     "show",
     "study",
     "system",
+    "that",
+    "their",
     "table",
     "task",
     "tasks",
     "technique",
+    "this",
     "using",
     "approaches",
+    "with",
+}
+
+_CATEGORY_LABELS = {
+    "cs.AI": "artificial intelligence",
+    "cs.CL": "natural language processing",
+    "cs.CV": "computer vision",
+    "cs.CY": "computers and society",
+    "cs.FL": "formal languages",
+    "cs.HC": "human-computer interaction",
+    "cs.LG": "machine learning",
+    "cs.MA": "multi-agent systems",
+    "cs.RO": "robotics",
+    "cond-mat.mes-hall": "mesoscopic condensed matter",
+    "physics.ins-det": "instrumentation",
+    "math.CO": "combinatorics",
+    "math.AP": "analysis of PDEs",
+    "stat.ML": "statistical machine learning",
 }
 
 
@@ -761,6 +782,143 @@ def _paper_keyword_target(row: Dict[str, Any], max_keywords: int = 8) -> str:
     return ", ".join(selected[:max_keywords]).strip() or (title or abstract or "keyword")
 
 
+def _paper_domain_label(row: Dict[str, Any]) -> str:
+    raw_categories = str(row.get("categories") or row.get("primary_category") or "").strip()
+    categories = [cat.strip() for cat in re.split(r"[\s,]+", raw_categories) if cat.strip()]
+    labels = [_CATEGORY_LABELS.get(cat, cat.replace(".", " ")) for cat in categories[:2]]
+    if labels:
+        return " and ".join(labels)
+    return "research"
+
+
+def _paper_method_summary_prompt(row: Dict[str, Any]) -> str:
+    title = str(row.get("title") or "").strip()
+    categories = str(row.get("categories") or row.get("primary_category") or "").strip()
+    abstract = str(row.get("abstract") or "").strip()
+    parts = [
+        "Create a concise research-library card for this paper.",
+        "Use the format: Problem / Method / Evidence / Library use / Tags.",
+    ]
+    if title:
+        parts.append(f"TITLE:\n{title}")
+    if categories:
+        parts.append(f"CATEGORIES:\n{categories}")
+    if abstract:
+        parts.append(f"ABSTRACT:\n{abstract}")
+    if len(parts) <= 2:
+        parts.append(_format_text_from_entry(row))
+    return "\n\n".join(parts).strip()
+
+
+def _clean_library_sentence(sentence: str, *, max_words: int = 34) -> str:
+    text = re.sub(r"\s+", " ", str(sentence or "")).strip()
+    text = re.sub(r"^(in|this)\s+paper\s*,?\s*", "", text, flags=re.IGNORECASE)
+    leading_verb = re.match(r"^we\s+(propose|present|introduce|develop|describe)\s+(.+)$", text, flags=re.IGNORECASE)
+    if leading_verb:
+        verb = {
+            "propose": "Proposes",
+            "present": "Presents",
+            "introduce": "Introduces",
+            "develop": "Develops",
+            "describe": "Describes",
+        }.get(leading_verb.group(1).lower(), leading_verb.group(1))
+        text = f"{verb} {leading_verb.group(2)}"
+    words = text.split()
+    if len(words) > max_words:
+        text = " ".join(words[:max_words]).rstrip(" ,;:") + "..."
+    return text.rstrip()
+
+
+def _select_sentence_by_terms(sentences: List[str], terms: Tuple[str, ...], fallback_index: int = 0) -> str:
+    for sentence in sentences:
+        lower = sentence.lower()
+        if any(term in lower for term in terms):
+            return sentence
+    if sentences:
+        if fallback_index < 0:
+            idx = max(0, len(sentences) + fallback_index)
+        else:
+            idx = min(fallback_index, len(sentences) - 1)
+        return sentences[idx]
+    return ""
+
+
+def _paper_method_summary_target(row: Dict[str, Any]) -> str:
+    abstract = str(row.get("abstract") or "").strip()
+    full_text = str(row.get("text") or "").strip()
+    title = str(row.get("title") or "").strip()
+    source = "\n".join(part for part in [abstract, full_text[:8000]] if part).strip()
+    sentences = _split_sentences(source, max_sentences=18)
+    keywords = [kw.strip() for kw in _paper_keyword_target(row, max_keywords=6).split(",") if kw.strip()]
+    domain = _paper_domain_label(row)
+
+    problem_sentence = _select_sentence_by_terms(
+        sentences,
+        (
+            "challenge",
+            "problem",
+            "objective",
+            "aim",
+            "goal",
+            "need",
+            "difficult",
+            "limitation",
+            "address",
+        ),
+        fallback_index=0,
+    )
+    method_sentence = _select_sentence_by_terms(
+        sentences,
+        (
+            "we propose",
+            "we present",
+            "our method",
+            "this paper introduces",
+            "we introduce",
+            "we develop",
+            "we describe",
+            "based on",
+            "uses",
+            "using",
+        ),
+        fallback_index=1,
+    )
+    evidence_sentence = _select_sentence_by_terms(
+        sentences,
+        (
+            "results show",
+            "we show",
+            "experiments show",
+            "we achieve",
+            "outperform",
+            "demonstrate",
+            "improves",
+            "evaluation",
+            "validated",
+        ),
+        fallback_index=-1,
+    )
+
+    problem = _clean_library_sentence(problem_sentence, max_words=28) or (title or "Research problem not specified")
+    method = _clean_library_sentence(method_sentence, max_words=34) or "Method details are not specified in the available text"
+    evidence = _clean_library_sentence(evidence_sentence, max_words=30)
+    if evidence and evidence == problem:
+        evidence = "Evidence is not specified in the available abstract"
+    evidence = evidence or "Evidence is not specified in the available abstract"
+    keyword_text = ", ".join(keywords[:6]) or domain
+    library_use = f"Useful for researchers browsing {domain} work related to {', '.join(keywords[:3]) or title or 'this topic'}."
+
+    return "\n".join(
+        [
+            f"Problem: {problem}",
+            f"Method: {method}",
+            f"Evidence: {evidence}",
+            f"Library use: {library_use}",
+            f"Tags: {keyword_text}",
+        ]
+    ).strip()
+
+
 def _paper_retrieval_query(row: Dict[str, Any]) -> str:
     title = str(row.get("title") or "").strip()
     abstract = str(row.get("abstract") or "").strip()
@@ -814,35 +972,10 @@ def _paper_document_view(row: Dict[str, Any], *, max_chars: int = 6000) -> str:
 def _build_paper_method_summary_samples(rows: List[Dict[str, Any]], max_samples: int) -> List[Dict[str, Any]]:
     samples: List[Dict[str, Any]] = []
     for row in rows[:max_samples]:
-        abstract = str(row.get("abstract") or "").strip()
         target = _paper_method_summary_target(row)
-        prompt = abstract or _format_text_from_entry(row)
+        prompt = _paper_method_summary_prompt(row)
         samples.append({"text": prompt, "target": target})
     return samples
-
-
-def _paper_method_summary_target(row: Dict[str, Any]) -> str:
-    hint_terms = (
-        "we propose",
-        "we present",
-        "our method",
-        "this paper introduces",
-        "we introduce",
-        "we develop",
-        "we describe",
-    )
-    abstract = str(row.get("abstract") or "").strip()
-    full_text = str(row.get("text") or "").strip()
-    target_sentences: List[str] = []
-    for sentence in _split_sentences(full_text or abstract, max_sentences=8):
-        if any(term in sentence.lower() for term in hint_terms):
-            target_sentences.append(sentence)
-        if len(target_sentences) >= 3:
-            break
-    if not target_sentences:
-        target_sentences = _split_sentences(abstract or full_text, max_sentences=3)
-    return " ".join(target_sentences).strip() or abstract or _format_text_from_entry(row)
-
 
 def _paper_problem_target(row: Dict[str, Any]) -> str:
     abstract = str(row.get("abstract") or "").strip()

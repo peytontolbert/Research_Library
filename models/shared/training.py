@@ -23,9 +23,12 @@ from models.shared.data import (
     _compose_full_paper_text,
     _format_text_from_entry,
     _load_teacher_embedding_lookup,
+    _metadata_embedding_doc,
+    _metadata_embedding_query,
     _normalize_paper_row,
     _paper_keyword_target,
     _paper_method_summary_target,
+    _paper_method_summary_prompt,
     _paper_parquet_paths,
     _paper_row_year,
 )
@@ -90,9 +93,10 @@ except Exception:  # pragma: no cover - optional dependency
     load_dataset = None
     concatenate_datasets = None
 try:
-    from torch.utils.data import DataLoader
+    from torch.utils.data import DataLoader, IterableDataset as TorchIterableDataset
 except Exception:  # pragma: no cover - optional dependency
     DataLoader = None
+    TorchIterableDataset = None
 try:
     import torch.nn.functional as F
 except Exception:  # pragma: no cover - optional dependency
@@ -115,11 +119,17 @@ def _maybe_import(transformer_name: str):
         )
 
 
-def _load_paper_text_dataset(construction: Dict[str, Any], ds_cfg: Dict[str, Any], training_cfg: Dict[str, Any]):
+def _load_paper_text_dataset(
+    construction: Dict[str, Any],
+    ds_cfg: Dict[str, Any],
+    training_cfg: Dict[str, Any],
+    *,
+    streaming: bool = False,
+):
     dataset_dir = construction.get("paper_dataset_dir") or "/arxiv/huggingface/paper_text_1m_dedup_v1"
     parquet_paths = _paper_parquet_paths(dataset_dir)
     if parquet_paths:
-        return load_dataset("parquet", data_files=[str(p) for p in parquet_paths], split="train")
+        return load_dataset("parquet", data_files=[str(p) for p in parquet_paths], split="train", streaming=streaming)
 
     dataset_id = (
         construction.get("paper_dataset_id")
@@ -129,10 +139,189 @@ def _load_paper_text_dataset(construction: Dict[str, Any], ds_cfg: Dict[str, Any
     )
     split = construction.get("paper_dataset_split") or ds_cfg.get("split") or "train"
     cache_dir = construction.get("cache_dir") or ds_cfg.get("cache_dir") or training_cfg.get("cache_dir")
-    kwargs: Dict[str, Any] = {"split": split}
+    kwargs: Dict[str, Any] = {"split": split, "streaming": streaming}
     if cache_dir:
         kwargs["cache_dir"] = cache_dir
     return load_dataset(str(dataset_id), **kwargs)
+
+
+def _streaming_enabled(config: Dict[str, Any]) -> bool:
+    dataset_cfg = config.get("dataset", {}) or {}
+    construction = dataset_cfg.get("construction", {}) or {}
+    training_cfg = config.get("training", {}) or {}
+    value = construction.get("streaming", dataset_cfg.get("streaming", training_cfg.get("streaming", False)))
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _paper_matches_training_filters(
+    row: Dict[str, Any],
+    *,
+    model_id: str,
+    years_filter: Any,
+    categories_filter: set[str],
+    ds_quality: Dict[str, Any],
+) -> bool:
+    if years_filter and len(years_filter) == 2:
+        year = _paper_row_year(row)
+        if year is not None and not (int(years_filter[0]) <= year <= int(years_filter[1])):
+            return False
+    if categories_filter:
+        categories = row.get("categories") or row.get("primary_category") or ""
+        if not any(cat in str(categories) for cat in categories_filter):
+            return False
+    if model_id in {"P1", "C3", "M6", "M7"}:
+        text = str(row.get("text") or "").strip()
+        if not text:
+            return False
+        min_chars = int(ds_quality.get("papers_min_chars", 256))
+        max_chars = int(ds_quality.get("papers_max_chars", 131072))
+        text_len = int(row.get("text_char_count") or len(text))
+        if not (min_chars <= text_len <= max_chars):
+            return False
+    else:
+        title = str(row.get("title") or "").strip()
+        abstract = str(row.get("abstract") or "").strip()
+        if not title and not abstract:
+            return False
+    if ds_quality.get("require_full_text", False) and bool(row.get("text_is_partial")):
+        return False
+    return True
+
+
+def _paper_training_examples(row: Dict[str, Any], *, model_id: str, construction: Dict[str, Any], prefer_seq2seq: bool):
+    if model_id == "A2":
+        yield {
+            "text": _paper_method_summary_prompt(row),
+            "target": _paper_method_summary_target(row),
+        }
+        return
+    if model_id == "A3":
+        yield {
+            "text": str(row.get("abstract") or "").strip() or _format_text_from_entry(row),
+            "target": _paper_keyword_target(row),
+        }
+        return
+    if model_id in {"P1", "C3"}:
+        chunk_chars = int(construction.get("chunk_chars_text", construction.get("chunk_chars_pdf", 8000)) or 8000)
+        chunk_overlap = int(construction.get("chunk_overlap_text", construction.get("chunk_overlap_pdf", 400)) or 400)
+        max_chunks_per_paper = max(1, int(construction.get("max_chunks_per_paper", 64) or 64))
+        if max_chunks_per_paper < 64:
+            chunks = []
+            for chunk, offset in _chunk_text(
+                _compose_full_paper_text(row),
+                chunk_chars=max(512, chunk_chars),
+                overlap=max(0, chunk_overlap),
+            ):
+                chunk = str(chunk or "").strip()
+                if chunk:
+                    chunks.append((chunk, offset))
+                if len(chunks) >= max_chunks_per_paper + 1:
+                    break
+            target_mode = "next_chunk" if model_id == "P1" and prefer_seq2seq else "none"
+            for idx, (chunk, offset) in enumerate(chunks[:max_chunks_per_paper]):
+                target = None
+                if target_mode == "next_chunk":
+                    if idx + 1 >= len(chunks):
+                        continue
+                    target = chunks[idx + 1][0]
+                yield {
+                    "text": chunk,
+                    "target": target,
+                    "paper_id": row.get("canonical_paper_id") or row.get("paper_id"),
+                    "pdf_path": row.get("pdf_path"),
+                    "offset": offset,
+                    "label": 0,
+                }
+            return
+        samples = _build_fulltext_samples(
+            [row],
+            max_samples=max_chunks_per_paper,
+            chunk_chars=chunk_chars,
+            overlap=chunk_overlap,
+            target_mode="next_chunk" if model_id == "P1" and prefer_seq2seq else "none",
+        )
+        for sample in samples:
+            yield sample
+        return
+    if model_id == "P5":
+        for sample in _build_paper_qa_samples([row], max_samples=3):
+            yield sample
+
+
+if TorchIterableDataset is not None:
+    class PaperTextStreamingDataset(TorchIterableDataset):
+        """Stream paper rows and tokenize on the fly to avoid Arrow cache blowup."""
+
+        def __init__(self, trainer: Any, raw: Any, *, construction: Dict[str, Any], ds_cfg: Dict[str, Any]):
+            self.trainer = trainer
+            self.raw = raw
+            self.construction = construction
+            self.ds_cfg = ds_cfg
+            self.model_id = str(trainer.config.get("model_id", ""))
+            self.filters = ds_cfg.get("filters") or {}
+            self.years_filter = self.filters.get("years")
+            self.categories_filter = set(self.filters.get("categories") or [])
+            self.ds_quality = ds_cfg.get("quality_filters") or {}
+            self.prefer_seq2seq = _prefer_seq2seq_config(trainer.config)
+            self.max_samples = int(construction.get("max_samples", 0) or 0)
+
+        def __iter__(self):
+            count = 0
+            previous_doc = ""
+            previous_paper_id = ""
+            for raw_row in self.raw:
+                row = _normalize_paper_row(raw_row)
+                if not _paper_matches_training_filters(
+                    row,
+                    model_id=self.model_id,
+                    years_filter=self.years_filter,
+                    categories_filter=self.categories_filter,
+                    ds_quality=self.ds_quality,
+                ):
+                    continue
+                if self.model_id == "M1":
+                    query = _metadata_embedding_query(row)
+                    doc = _metadata_embedding_doc(row)
+                    paper_id = str(row.get("canonical_paper_id") or row.get("paper_id") or "").strip()
+                    if not query or not doc:
+                        continue
+                    examples = [
+                        {
+                            "text_a": query,
+                            "text_b": f"METADATA_CARD:\n{doc}",
+                            "label": 1,
+                            "paper_id": paper_id,
+                        }
+                    ]
+                    if previous_doc and previous_doc != doc:
+                        examples.append(
+                            {
+                                "text_a": query,
+                                "text_b": f"METADATA_CARD:\n{previous_doc}",
+                                "label": 0,
+                                "paper_id": previous_paper_id,
+                            }
+                        )
+                    previous_doc = doc
+                    previous_paper_id = paper_id
+                    for example in examples:
+                        yield self.trainer._tokenize_fn(example)
+                        count += 1
+                        if self.max_samples > 0 and count >= self.max_samples:
+                            return
+                    continue
+                for example in _paper_training_examples(
+                    row,
+                    model_id=self.model_id,
+                    construction=self.construction,
+                    prefer_seq2seq=self.prefer_seq2seq,
+                ):
+                    yield self.trainer._tokenize_fn(example)
+                    count += 1
+                    if self.max_samples > 0 and count >= self.max_samples:
+                        return
+else:  # pragma: no cover - torch unavailable
+    PaperTextStreamingDataset = None
 
 
 def build_tokenizer(config: Dict[str, Any]):
@@ -658,7 +847,7 @@ class Trainer:
         so we can train over the full corpus (repos, papers, and/or pairs)
         backed by Arrow/JSONL on disk.
         """
-        if load_dataset is None or HFDataset is None:
+        if load_dataset is None:
             return None
 
         ds_cfg = self.config.get("dataset", {}) or {}
@@ -853,6 +1042,29 @@ class Trainer:
         with _datasets_fingerprint_compatible_env():
             filters = ds_cfg.get("filters") or {}
             training_cfg = self.config.get("training", {}) or {}
+            if _streaming_enabled(self.config):
+                if PaperTextStreamingDataset is None:
+                    return None
+                raw = _load_paper_text_dataset(construction, ds_cfg, training_cfg, streaming=True)
+                shuffle_buffer = int(construction.get("streaming_shuffle_buffer", training_cfg.get("streaming_shuffle_buffer", 10_000)) or 0)
+                if shuffle_buffer > 0 and hasattr(raw, "shuffle"):
+                    raw = raw.shuffle(
+                        seed=int(training_cfg.get("shuffle_seed", construction.get("shuffling_seed", 42))),
+                        buffer_size=shuffle_buffer,
+                    )
+                epoch_samples = int(construction.get("streaming_epoch_samples", training_cfg.get("streaming_epoch_samples", 1_000_000)) or 0)
+                if epoch_samples > 0 and int(training_cfg.get("max_steps", -1) or -1) <= 0:
+                    batch_size = max(1, int(training_cfg.get("batch_size", 1) or 1))
+                    grad_accum = max(1, int(training_cfg.get("gradient_accumulation_steps", 1) or 1))
+                    training_cfg["max_steps"] = max(1, (epoch_samples + (batch_size * grad_accum) - 1) // (batch_size * grad_accum))
+                    print(
+                        "[train] streaming paper dataset enabled; "
+                        f"max_steps={training_cfg['max_steps']} from streaming_epoch_samples={epoch_samples}."
+                    )
+                training_cfg["evaluation_strategy"] = "no"
+                training_cfg["eval_strategy"] = "no"
+                training_cfg["load_best_model_at_end"] = False
+                return PaperTextStreamingDataset(self, raw, construction=construction, ds_cfg=ds_cfg)
             raw = _load_paper_text_dataset(construction, ds_cfg, training_cfg)
             years_filter = filters.get("years")
             categories_filter = set(filters.get("categories") or [])
@@ -918,7 +1130,7 @@ class Trainer:
                 size = len(next(iter(batch.values()))) if batch else 0
                 for idx in range(size):
                     row = _normalize_paper_row({k: batch[k][idx] for k in batch})
-                    texts.append(str(row.get("abstract") or "").strip() or _format_text_from_entry(row))
+                    texts.append(_paper_method_summary_prompt(row))
                     targets.append(_paper_method_summary_target(row))
                 return {"text": texts, "target": targets}
 
@@ -950,13 +1162,14 @@ class Trainer:
                 samples = []
                 chunk_chars = int(construction.get("chunk_chars_text", construction.get("chunk_chars_pdf", 8000)) or 8000)
                 chunk_overlap = int(construction.get("chunk_overlap_text", construction.get("chunk_overlap_pdf", 400)) or 400)
+                max_chunks_per_paper = max(1, int(construction.get("max_chunks_per_paper", 64) or 64))
                 size = len(next(iter(batch.values()))) if batch else 0
                 rows = []
                 for idx in range(size):
                     rows.append(_normalize_paper_row({k: batch[k][idx] for k in batch}))
                 samples = _build_fulltext_samples(
                     rows,
-                    max_samples=max(1, size * 64),
+                    max_samples=max(1, size * max_chunks_per_paper),
                     chunk_chars=chunk_chars,
                     overlap=chunk_overlap,
                     target_mode="next_chunk" if model_id == "P1" and prefer_seq2seq else "none",
@@ -1335,11 +1548,12 @@ class Trainer:
         has_eval = isinstance(ds, dict)
         train_ds = ds["train"] if has_eval else ds
         eval_ds = ds["eval"] if has_eval else None
+        is_streaming_train = TorchIterableDataset is not None and isinstance(train_ds, TorchIterableDataset)
         # Collect label space for classifiers
         training_cfg = self.config.get("training", {})
         archetype = get_archetype(self.config.get("model_id", "")) or {}
         objective = training_cfg.get("objective")
-        if objective == "cross_entropy" and archetype.get("archetype") == "classifier":
+        if (not is_streaming_train) and objective == "cross_entropy" and archetype.get("archetype") == "classifier":
             labels = set()
             for ex in (train_ds if not has_eval else train_ds):
                 if ex.get("label") is not None:
@@ -1351,7 +1565,12 @@ class Trainer:
                 self.backbone.config.id2label = {idx: lbl for lbl, idx in self.label_to_id.items()}
 
         self._maybe_prepare_teacher_projection(train_ds)
-        tokenized_train = train_ds.map(self._tokenize_fn, remove_columns=list(train_ds.features))
+        if is_streaming_train:
+            tokenized_train = train_ds
+            eval_ds = None
+            has_eval = False
+        else:
+            tokenized_train = train_ds.map(self._tokenize_fn, remove_columns=list(train_ds.features))
         tokenized_eval = None
         if eval_ds is not None:
             eval_ds = _maybe_limit_eval_dataset(eval_ds, training_cfg)
@@ -1484,22 +1703,31 @@ class Trainer:
                         labels = labels.detach()
                     return (loss, None, labels)
 
-            trainer = ContrastiveTrainer(
-                model=self.backbone,
-                args=args,
-                train_dataset=tokenized_train,
-                tokenizer=self.tokenizer,
-                data_collator=default_data_collator,
-                eval_dataset=tokenized_eval,
-            )
+            trainer_kwargs = {
+                "model": self.backbone,
+                "args": args,
+                "train_dataset": tokenized_train,
+                "data_collator": default_data_collator,
+                "eval_dataset": tokenized_eval,
+            }
+            trainer_params = inspect.signature(ContrastiveTrainer.__init__).parameters
+            if "processing_class" in trainer_params:
+                trainer_kwargs["processing_class"] = self.tokenizer
+            elif "tokenizer" in trainer_params:
+                trainer_kwargs["tokenizer"] = self.tokenizer
+            trainer = ContrastiveTrainer(**trainer_kwargs)
         else:
             trainer_kwargs = {
                 "model": self.backbone,
                 "args": args,
                 "train_dataset": tokenized_train,
-                "tokenizer": self.tokenizer,
                 "data_collator": default_data_collator,
             }
+            trainer_params = inspect.signature(HFTrainer.__init__).parameters
+            if "processing_class" in trainer_params:
+                trainer_kwargs["processing_class"] = self.tokenizer
+            elif "tokenizer" in trainer_params:
+                trainer_kwargs["tokenizer"] = self.tokenizer
             if tokenized_eval is not None:
                 trainer_kwargs["eval_dataset"] = tokenized_eval
             trainer = HFTrainer(**trainer_kwargs)
@@ -1509,6 +1737,10 @@ class Trainer:
             trainer.train(resume_from_checkpoint=resume_checkpoint)
         else:
             trainer.train()
+        if hasattr(trainer, "save_model"):
+            trainer.save_model(out_dir)
+        if hasattr(trainer, "save_state"):
+            trainer.save_state()
         return True
 
     def train(self):

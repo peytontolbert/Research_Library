@@ -10,7 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from models.shared.data import _build_metadata_embedding_samples, build_dataset
+from models.shared.data import _build_metadata_embedding_samples, _paper_method_summary_target, build_dataset
 import models.shared.training as training
 from models.shared.training import Trainer
 
@@ -132,10 +132,39 @@ def test_build_dataset_zero_max_samples_means_unlimited_paper_text(tmp_path: Pat
 
     samples = build_dataset(config)
 
-    assert {sample["text"] for sample in samples} == {
-        "We propose a first unlimited paper sample.",
-        "We propose a second unlimited paper sample.",
+    assert {sample["target"].splitlines()[0] for sample in samples} == {
+        "Problem: Proposes a first unlimited paper sample.",
+        "Problem: Proposes a second unlimited paper sample.",
     }
+    assert all(sample["text"].startswith("Create a concise research-library card") for sample in samples)
+    assert all("ABSTRACT:" in sample["text"] for sample in samples)
+
+
+def test_a2_library_card_target_is_structured_and_not_abstract_copy() -> None:
+    row = {
+        "title": "Agent-Based Pandemic Modeling for Regional Planning",
+        "abstract": (
+            "Pandemic influenza has great potential to cause large and rapid increases in deaths and serious illness. "
+            "The objective of this paper is to develop an agent-based model to simulate the spread of pandemic influenza in Egypt. "
+            "The proposed multi-agent model is based on modeling individuals' interactions in a space time context. "
+            "Experiments show that intervention timing changes the outbreak curve."
+        ),
+        "categories": "cs.MA cs.CY",
+        "text": (
+            "We propose a simulation model with social agent attributes and interaction patterns. "
+            "Results show that intervention timing changes the outbreak curve."
+        ),
+    }
+
+    target = _paper_method_summary_target(row)
+
+    assert target.startswith("Problem: ")
+    assert "\nMethod: " in target
+    assert "\nEvidence: " in target
+    assert "\nLibrary use: " in target
+    assert "\nTags: " in target
+    assert target != row["abstract"]
+    assert not target.startswith(row["abstract"][:80])
 
 
 def test_metadata_embedding_samples_use_title_query_and_metadata_card() -> None:
@@ -329,10 +358,11 @@ def test_trainer_build_hf_dataset_falls_back_to_hf_dataset_id(monkeypatch, tmp_p
     assert calls == [
         (
             "PeytonT/1m_papers_text",
-            {"split": "train", "cache_dir": str(tmp_path / "hf-cache")},
+            {"split": "train", "streaming": False, "cache_dir": str(tmp_path / "hf-cache")},
         )
     ]
-    assert ds[0]["text"].startswith("We propose loading")
+    assert ds[0]["text"].startswith("Create a concise research-library card")
+    assert "ABSTRACT:\nWe propose loading" in ds[0]["text"]
     assert "Hugging Face" in ds[0]["target"]
 
 
