@@ -42,9 +42,9 @@ The **export pipeline** in `build.py` and `scripts/library_repo_graph_export.py`
   - `{repo_id}.artifacts.jsonl`
 - Updating a shared manifest in `exports/_manifest.json` with per-repo metadata and (in later steps) skillset information.
 
-### Public Datasets Created From This Repo
+### Public Hugging Face Datasets and Models
 
-This repository also contains the scripts used to publish public Hugging Face datasets derived from those exports.
+This repository also contains the scripts and model-training configs used to publish public Hugging Face datasets and model adapters derived from those exports.
 
 #### `PeytonT/repo_graph`
 
@@ -100,6 +100,56 @@ Current public snapshot:
 - As published on April 19, 2026, the public dataset contains `1,000,000` papers, all with matched arXiv metadata.
 - The export was generated with `--prefer-raw-pdf-text` and `--raw-pdf-max-chars 0`, which means the PDF-sourced rows are intended to be full-document extracts rather than capped snippets.
 - In practical terms, this dataset is a public text corpus for paper-scale retrieval, search, and training workflows, with enough metadata to filter by license and provenance before reuse.
+
+#### `PeytonT/paper_graph`
+
+Dataset: [huggingface.co/datasets/PeytonT/paper_graph](https://huggingface.co/datasets/PeytonT/paper_graph)
+
+Relevant scripts:
+
+- `scripts/paper_universe_build.py` builds the parquet-backed paper universe graph from the 1M-paper text dataset without duplicating the full text.
+- `docs/paper_universe.md` documents the graph layout, embedding shards, KNN construction, category/year edges, and resume behavior.
+
+What the dataset is:
+
+- A graph-first companion dataset for `PeytonT/1m_papers_text`.
+- It represents papers as nodes and relationships as edges rather than republishing full paper text.
+- It is intended for paper-universe browsing, graph search, retrieval experiments, clustering, and 3D visualization.
+- The full paper text remains in `PeytonT/1m_papers_text`; this dataset focuses on paper metadata, embeddings, graph neighborhoods, and layout-ready structures.
+
+#### `PeytonT/1m-paper-embedding-model`
+
+Model: [huggingface.co/PeytonT/1m-paper-embedding-model](https://huggingface.co/PeytonT/1m-paper-embedding-model)
+
+What the model is:
+
+- The public M1 paper metadata embedding adapter.
+- It is a PEFT/LoRA adapter trained on `PeytonT/1m_papers_text` for scientific-paper retrieval.
+- It embeds paper queries and metadata cards so the library can search, rank, and navigate papers by title, abstract, category, and author metadata.
+- It is intended for retrieval and feature extraction, not text generation.
+
+Local training/config references:
+
+- Experiment config: `models/experiments/m1_metadata_embedding.json`
+- Model implementation: `models/tier1_metadata/metadata_embedding.py`
+- Local checkpoint family: `models/checkpoints/M1/`
+
+#### `PeytonT/1m-papers-abstract-keywords`
+
+Model: [huggingface.co/PeytonT/1m-papers-abstract-keywords](https://huggingface.co/PeytonT/1m-papers-abstract-keywords)
+
+What the model is:
+
+- The public A3 abstract-to-keywords adapter.
+- It is a PEFT/LoRA adapter for `google/flan-t5-base` trained on `PeytonT/1m_papers_text`.
+- It generates concise keyword lists from scientific-paper abstracts for tagging, indexing, clustering, and paper-library browsing.
+- Raw generations can repeat terms, so downstream callers should de-duplicate and optionally remove stopwords.
+
+Local training/config references:
+
+- Experiment config: `models/experiments/a3_abstract_keywords_h100_streaming.json`
+- Model implementation: `models/tier2_abstract/abstract_keywords.py`
+- Final local checkpoint: `models/checkpoints/A3/checkpoint-3895/`
 
 ### SkillSets (Per-Repository Skills)
 
