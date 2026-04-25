@@ -35,6 +35,11 @@ from models.shared.code_encoder import CodeEncoder
 
 BitsAndBytesConfig = None  # lazy import to avoid bitsandbytes errors when unavailable
 
+# Prefer the less-fragmenting CUDA allocator before torch initializes. This is
+# particularly important for quantized + PEFT training where eval can otherwise
+# fail despite several GiB being reserved but unallocated.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 try:
     import torch
 except Exception:  # pragma: no cover - optional dependency
@@ -108,6 +113,26 @@ def _maybe_import(transformer_name: str):
         raise ImportError(
             f"Missing transformers dependency for {transformer_name}: {exc}"
         )
+
+
+def _load_paper_text_dataset(construction: Dict[str, Any], ds_cfg: Dict[str, Any], training_cfg: Dict[str, Any]):
+    dataset_dir = construction.get("paper_dataset_dir") or "/arxiv/huggingface/paper_text_1m_dedup_v1"
+    parquet_paths = _paper_parquet_paths(dataset_dir)
+    if parquet_paths:
+        return load_dataset("parquet", data_files=[str(p) for p in parquet_paths], split="train")
+
+    dataset_id = (
+        construction.get("paper_dataset_id")
+        or construction.get("paper_dataset_name")
+        or ds_cfg.get("paper_dataset_id")
+        or "PeytonT/1m_papers_text"
+    )
+    split = construction.get("paper_dataset_split") or ds_cfg.get("split") or "train"
+    cache_dir = construction.get("cache_dir") or ds_cfg.get("cache_dir") or training_cfg.get("cache_dir")
+    kwargs: Dict[str, Any] = {"split": split}
+    if cache_dir:
+        kwargs["cache_dir"] = cache_dir
+    return load_dataset(str(dataset_id), **kwargs)
 
 
 def build_tokenizer(config: Dict[str, Any]):
@@ -273,6 +298,70 @@ def _normalize_dataset_splits(ds: Any) -> Any:
     return out
 
 
+def _resolve_eval_max_samples(training_cfg: Dict[str, Any]) -> int:
+    raw_value = training_cfg.get("eval_max_samples", 256)
+    if raw_value is None:
+        return 0
+    try:
+        value = int(raw_value)
+    except Exception:
+        return 256
+    return max(0, value)
+
+
+def _maybe_limit_eval_dataset(eval_ds: Any, training_cfg: Dict[str, Any]) -> Any:
+    max_samples = _resolve_eval_max_samples(training_cfg)
+    if not max_samples:
+        return eval_ds
+    try:
+        length = len(eval_ds)
+    except Exception:
+        return eval_ds
+    if length <= max_samples:
+        return eval_ds
+    if hasattr(eval_ds, "select"):
+        return eval_ds.select(range(max_samples))
+    try:
+        return eval_ds[:max_samples]
+    except Exception:
+        return eval_ds
+
+
+def _latest_checkpoint_dir(output_dir: str) -> Optional[str]:
+    root = Path(str(output_dir or ""))
+    if not root.is_dir():
+        return None
+    candidates = []
+    for path in root.glob("checkpoint-*"):
+        if not path.is_dir():
+            continue
+        suffix = path.name.rsplit("-", 1)[-1]
+        try:
+            step = int(suffix)
+        except Exception:
+            continue
+        candidates.append((step, path))
+    if not candidates:
+        return None
+    return str(max(candidates, key=lambda item: item[0])[1])
+
+
+def _resolve_resume_checkpoint(output_dir: str, training_cfg: Dict[str, Any]) -> Optional[str]:
+    raw_value = training_cfg.get("resume_from_checkpoint", "auto")
+    if raw_value is False:
+        return None
+    if isinstance(raw_value, str):
+        normalized = raw_value.strip().lower()
+        if normalized in {"", "false", "no", "none", "off", "0"}:
+            return None
+        if normalized not in {"true", "yes", "auto", "1"}:
+            if not Path(raw_value).exists():
+                print(f"[train] resume checkpoint not found, starting fresh: {raw_value}")
+                return None
+            return str(raw_value)
+    return _latest_checkpoint_dir(output_dir)
+
+
 def _training_arguments_kwargs(
     training_cfg: Dict[str, Any],
     *,
@@ -294,6 +383,9 @@ def _training_arguments_kwargs(
         "num_train_epochs": training_cfg.get("num_epochs", 1),
         "max_steps": training_cfg.get("max_steps", -1),
         "per_device_train_batch_size": training_cfg.get("batch_size", 1),
+        # Eval has a much larger activation/logit footprint for causal LM
+        # losses. Default it to 1 unless explicitly overridden.
+        "per_device_eval_batch_size": training_cfg.get("eval_batch_size", 1),
         "gradient_accumulation_steps": training_cfg.get("gradient_accumulation_steps", 1),
         "learning_rate": training_cfg.get("learning_rate", 5e-5),
         "weight_decay": training_cfg.get("weight_decay", 0.0),
@@ -304,6 +396,7 @@ def _training_arguments_kwargs(
         "save_steps": training_cfg.get("save_steps", 200),
         "save_total_limit": 1,
         "remove_unused_columns": False,
+        "prediction_loss_only": training_cfg.get("prediction_loss_only", True),
         "report_to": [],
         "no_cuda": not use_cuda,
     }
@@ -315,6 +408,10 @@ def _training_arguments_kwargs(
         kwargs["save_strategy"] = save_strategy
     if has_eval and eval_strategy != "no" and "eval_steps" in params:
         kwargs["eval_steps"] = training_cfg.get("eval_steps", 200)
+    if has_eval and eval_strategy != "no" and "eval_accumulation_steps" in params:
+        kwargs["eval_accumulation_steps"] = training_cfg.get("eval_accumulation_steps", 1)
+    if use_cuda and has_eval and eval_strategy != "no" and "torch_empty_cache_steps" in params:
+        kwargs["torch_empty_cache_steps"] = training_cfg.get("torch_empty_cache_steps", training_cfg.get("eval_steps", 200))
     if "load_best_model_at_end" in params:
         kwargs["load_best_model_at_end"] = load_best_model
     if load_best_model and "metric_for_best_model" in params:
@@ -753,21 +850,16 @@ class Trainer:
             return None
 
         construction = ds_cfg.get("construction") or {}
-        dataset_dir = construction.get("paper_dataset_dir") or "/arxiv/huggingface/paper_text_1m_dedup_v1"
-        parquet_paths = _paper_parquet_paths(dataset_dir)
-        if not parquet_paths:
-            return None
-
         with _datasets_fingerprint_compatible_env():
-            raw = load_dataset("parquet", data_files=[str(p) for p in parquet_paths], split="train")
             filters = ds_cfg.get("filters") or {}
+            training_cfg = self.config.get("training", {}) or {}
+            raw = _load_paper_text_dataset(construction, ds_cfg, training_cfg)
             years_filter = filters.get("years")
             categories_filter = set(filters.get("categories") or [])
             ds_quality = ds_cfg.get("quality_filters") or {}
             archetype = get_archetype(self.config.get("model_id", "")) or {}
             archetype_name = archetype.get("archetype", "generative")
             model_id = self.config.get("model_id", "")
-            training_cfg = self.config.get("training", {}) or {}
             eval_split = _resolve_eval_split(self.config)
             max_samples = int(construction.get("max_samples", 0) or 0)
             shuffle_seed = int(training_cfg.get("shuffle_seed", construction.get("shuffling_seed", 42)))
@@ -1262,7 +1354,17 @@ class Trainer:
         tokenized_train = train_ds.map(self._tokenize_fn, remove_columns=list(train_ds.features))
         tokenized_eval = None
         if eval_ds is not None:
+            eval_ds = _maybe_limit_eval_dataset(eval_ds, training_cfg)
             tokenized_eval = eval_ds.map(self._tokenize_fn, remove_columns=list(eval_ds.features))
+            tokenized_eval = _maybe_limit_eval_dataset(tokenized_eval, training_cfg)
+            try:
+                print(
+                    "[train] eval dataset capped at "
+                    f"{len(tokenized_eval):,} samples "
+                    "(training.eval_max_samples; set 0 to disable cap)."
+                )
+            except Exception:
+                pass
         training_cfg = self.config.get("training", {})
         cache_cfg = validate_cache_dirs(self.config)
         preferred_out = training_cfg.get("checkpoint_dir", cache_cfg["training"]["checkpoint_dir"])
@@ -1401,7 +1503,12 @@ class Trainer:
             if tokenized_eval is not None:
                 trainer_kwargs["eval_dataset"] = tokenized_eval
             trainer = HFTrainer(**trainer_kwargs)
-        trainer.train()
+        resume_checkpoint = _resolve_resume_checkpoint(out_dir, training_cfg)
+        if resume_checkpoint:
+            print(f"[train] resuming HF Trainer from {resume_checkpoint}")
+            trainer.train(resume_from_checkpoint=resume_checkpoint)
+        else:
+            trainer.train()
         return True
 
     def train(self):

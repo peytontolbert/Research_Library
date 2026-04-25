@@ -20,9 +20,9 @@ def test_render_paper_universe_assets_writes_pngs(tmp_path: Path) -> None:
     _write_parquet(
         universe_dir / "paper_nodes.parquet",
         [
-            {"x": 0.0, "y": 0.0, "z": 0.0, "primary_category": "cs.AI"},
-            {"x": 1.0, "y": 0.5, "z": -0.5, "primary_category": "cs.LG"},
-            {"x": -0.5, "y": 1.0, "z": 0.25, "primary_category": "math.OC"},
+            {"x": 0.0, "y": 0.0, "z": 0.0, "primary_category": "cs.AI", "year": 2024, "title": "Paper One"},
+            {"x": 1.0, "y": 0.5, "z": -0.5, "primary_category": "cs.LG", "year": 2024, "title": "Paper Two"},
+            {"x": -0.5, "y": 1.0, "z": 0.25, "primary_category": "math.OC", "year": 2025, "title": "Paper Three"},
         ],
     )
     _write_parquet(
@@ -52,3 +52,8 @@ def test_render_paper_universe_assets_writes_pngs(tmp_path: Path) -> None:
     assert Path(result["overview_image"]).stat().st_size > 0
     assert Path(result["detailed_image"]).stat().st_size > 0
     assert (universe_dir / "render_manifest.json").is_file()
+    assert result["overview"]["paper_points"] == 3
+    assert result["overview"]["categories_represented"] == 3
+    assert result["overview"]["years_represented"] == 2
+    assert result["detailed"]["paper_points"] == 3
+    assert result["detailed"]["labeled_papers"] >= 1

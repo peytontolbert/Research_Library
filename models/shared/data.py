@@ -38,6 +38,21 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 PDF_SEARCH_ROOTS = [REPO_ROOT / "exports/arxiv_pdfs", Path("/arxiv/pdfs")]
 DEFAULT_PAPER_DATASET_DIR = Path("/arxiv/huggingface/paper_text_1m_dedup_v1")
 DEFAULT_PAPER_UNIVERSE_DIR = REPO_ROOT / "exports/_paper_universe"
+UNLIMITED_SAMPLES = 10**18
+
+
+def _resolve_max_samples(raw_value: Any, default: int = 32) -> int:
+    try:
+        value = int(raw_value if raw_value is not None else default)
+    except Exception:
+        value = default
+    return UNLIMITED_SAMPLES if value <= 0 else value
+
+
+def _limit_samples(samples: List[Dict[str, Any]], max_samples: int) -> List[Dict[str, Any]]:
+    if max_samples >= UNLIMITED_SAMPLES:
+        return samples
+    return samples[:max_samples]
 
 
 def _candidate_data_paths(path_like: Path | str) -> List[Path]:
@@ -1457,7 +1472,7 @@ def build_dataset(config: Dict[str, Any]):
     Returns mixed samples; objective-specific shaping is left to downstream collators.
     """
     construction = config.get("dataset", {}).get("construction", {}) if isinstance(config.get("dataset", {}), dict) else {}
-    max_samples = construction.get("max_samples", 32)
+    max_samples = _resolve_max_samples(construction.get("max_samples"), default=32)
     chunk_chars_pdf = construction.get("chunk_chars_pdf", 8000)
     chunk_overlap_pdf = construction.get("chunk_overlap_pdf", 400)
     chunk_chars_text = construction.get("chunk_chars_text", chunk_chars_pdf)
@@ -1504,7 +1519,7 @@ def build_dataset(config: Dict[str, Any]):
                 samples.extend([paper_sample_to_text(ps) for ps in paper_samples])
         except Exception:
             pass
-        return samples[:max_samples] if samples else [{"text": "graph placeholder", "label": 0}]
+        return _limit_samples(samples, max_samples) if samples else [{"text": "graph placeholder", "label": 0}]
 
     try:
         filters = config.get("dataset", {}).get("filters", {}) if isinstance(config.get("dataset", {}), dict) else {}
@@ -1590,7 +1605,7 @@ def build_dataset(config: Dict[str, Any]):
                     else:
                         samples.append({"text_a": paper, "text_b": repo, "label": label})
                 # If alignment pairs exist, skip the generic PDF/repo mixing for these models.
-                return samples[:max_samples]
+                return _limit_samples(samples, max_samples)
         # Supplemental sources: prefer structured shards if available.
         # Prefer explicit corpus shards when requested; they are the unified
         # view built by models.scripts.build_corpus and scale better than
@@ -1638,4 +1653,4 @@ def build_dataset(config: Dict[str, Any]):
     if samples and model_id in {"M6", "M7"}:
         samples = _attach_teacher_embeddings(samples, construction)
 
-    return samples[:max_samples]
+    return _limit_samples(samples, max_samples)

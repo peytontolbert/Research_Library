@@ -25,7 +25,7 @@ import pyarrow.parquet as pq  # type: ignore
 
 
 DEFAULT_UNIVERSE_DIR = Path("/data/repository_library/exports/_paper_universe")
-DEFAULT_LEVELS = (50000, 200000)
+DEFAULT_LEVELS = (50000, 200000, -1)
 DEFAULT_BATCH_ROWS = 8192
 INTERACTIVE_DIRNAME = "interactive"
 
@@ -41,6 +41,19 @@ def _sample_positions(total_rows: int, sample_size: int, seed: int) -> Set[int]:
     rng = random.Random(int(seed))
     positions = rng.sample(range(total_rows), cap) if cap < total_rows else list(range(total_rows))
     return set(positions)
+
+
+def _iter_rows(
+    parquet_path: Path,
+    *,
+    columns: Sequence[str],
+    batch_rows: int,
+) -> List[Dict[str, Any]]:
+    parquet_file = pq.ParquetFile(parquet_path)
+    selected: List[Dict[str, Any]] = []
+    for batch in parquet_file.iter_batches(columns=list(columns), batch_size=max(1, int(batch_rows or 1))):
+        selected.extend(batch.to_pylist())
+    return selected
 
 
 def _iter_sampled_rows(
@@ -81,13 +94,21 @@ def _write_json(path: Path, payload: Any) -> None:
 def _paper_rows_for_level(universe_dir: Path, *, sample_size: int, seed: int, batch_rows: int) -> List[Dict[str, Any]]:
     paper_path = universe_dir / "paper_nodes.parquet"
     total_rows = int(pq.ParquetFile(paper_path).metadata.num_rows)
-    positions = _sample_positions(total_rows, sample_size, seed)
-    rows = _iter_sampled_rows(
-        paper_path,
-        columns=["paper_id", "canonical_paper_id", "title", "primary_category", "year", "x", "y", "z"],
-        positions=positions,
-        batch_rows=batch_rows,
-    )
+    columns = ["paper_id", "canonical_paper_id", "title", "primary_category", "year", "x", "y", "z"]
+    if int(sample_size or 0) <= 0 or int(sample_size) >= total_rows:
+        rows = _iter_rows(
+            paper_path,
+            columns=columns,
+            batch_rows=batch_rows,
+        )
+    else:
+        positions = _sample_positions(total_rows, sample_size, seed)
+        rows = _iter_sampled_rows(
+            paper_path,
+            columns=columns,
+            positions=positions,
+            batch_rows=batch_rows,
+        )
     out: List[Dict[str, Any]] = []
     for row in rows:
         out.append(
@@ -184,10 +205,10 @@ def _write_viewer_html(universe_dir: Path, asset_dir: str) -> str:
   <div id="controls">
     <label for="viewMode">View:</label>
     <select id="viewMode">
-      <option value="papers">Papers</option>
-      <option value="categories">Categories</option>
-      <option value="papers+categories" selected>Papers + Categories</option>
-      <option value="all">All</option>
+      <option value="papers" selected>Paper Nodes</option>
+      <option value="papers+categories">Paper Nodes + Category Anchors</option>
+      <option value="all">Paper Nodes + Category + Year Anchors</option>
+      <option value="categories">Category Anchors Only</option>
     </select>
     <label for="paperLevel">Paper LOD:</label>
     <select id="paperLevel"></select>
@@ -201,12 +222,12 @@ def _write_viewer_html(universe_dir: Path, asset_dir: str) -> str:
     <select id="categoryFilter">
       <option value="">All Categories</option>
     </select>
-    <span class="hint">Click a category anchor to filter papers.</span>
+    <span class="hint">Double-click a paper node to load it in the library. Click a category anchor to filter visible paper nodes.</span>
     <span id="status">loading…</span>
   </div>
   <div id="app"></div>
   <script>
-    const {{Deck, ScatterplotLayer, TextLayer, OrbitView, OrbitController}} = deck;
+    const {{Deck, ScatterplotLayer, TextLayer, OrbitView}} = deck;
     const assetRoot = './{asset_dir}/';
     const viewModeEl = document.getElementById('viewMode');
     const paperLevelEl = document.getElementById('paperLevel');
@@ -217,6 +238,8 @@ def _write_viewer_html(universe_dir: Path, asset_dir: str) -> str:
     let manifest = null;
     let cached = {{}};
     let currentViewState = null;
+    const INITIAL_ZOOM = 2.2;
+    let selectionBridgeBound = false;
 
     function hashColor(str) {{
       let h = 0;
@@ -241,6 +264,41 @@ def _write_viewer_html(universe_dir: Path, asset_dir: str) -> str:
 
     function categoryColor(row) {{
       return hashColor(row.category_id || 'category');
+    }}
+
+    function acknowledgePaperSelection(row) {{
+      if (!row || !statusEl) return;
+      const title = row.title || row.canonical_paper_id || row.paper_id || 'paper';
+      const category = row.primary_category ? ` · ${{row.primary_category}}` : '';
+      statusEl.textContent = `paper selected: ${{title}}${{category}} · loading in library…`;
+      statusEl.style.color = '#0f766e';
+      window.setTimeout(() => {{
+        if (statusEl.textContent.startsWith('paper selected:')) {{
+          statusEl.style.color = '#334155';
+        }}
+      }}, 1800);
+    }}
+
+    function emitPaperSelection(row) {{
+      if (!row || !window.parent || window.parent === window) return;
+      acknowledgePaperSelection(row);
+      try {{
+        window.parent.postMessage(
+          {{
+            type: 'paper_universe_select_paper',
+            paper: {{
+              paper_id: row.paper_id || '',
+              canonical_paper_id: row.canonical_paper_id || '',
+              title: row.title || '',
+              primary_category: row.primary_category || '',
+              year: row.year || 0
+            }}
+          }},
+          window.location.origin
+        );
+      }} catch (err) {{
+        console.warn('failed to emit paper selection', err);
+      }}
     }}
 
     async function loadJson(path) {{
@@ -274,9 +332,8 @@ def _write_viewer_html(universe_dir: Path, asset_dir: str) -> str:
       if (deckgl) return deckgl;
         deckgl = new Deck({{
           parent: document.getElementById('app'),
-          views: [new OrbitView({{orbitAxis: 'Z'}})],
-          controller: new OrbitController(),
-          initialViewState: {{target: [0, 0, 0], rotationX: 25, rotationOrbit: 35, zoom: 0.2}},
+          views: [new OrbitView({{orbitAxis: 'Z', controller: {{doubleClickZoom: false}}}})],
+          initialViewState: {{target: [0, 0, 0], rotationX: 25, rotationOrbit: 35, zoom: INITIAL_ZOOM}},
           getTooltip: ({{object, layer}}) => {{
           if (!object) return null;
           if (layer && layer.id === 'papers') {{
@@ -300,6 +357,31 @@ def _write_viewer_html(universe_dir: Path, asset_dir: str) -> str:
           return null;
         }}
       }});
+      if (!selectionBridgeBound) {{
+        const canvas = deckgl.canvas || document.querySelector('#app canvas');
+        if (canvas) {{
+          canvas.addEventListener(
+            'dblclick',
+            event => {{
+              event.preventDefault();
+              event.stopPropagation();
+              const rect = canvas.getBoundingClientRect();
+              const info = deckgl.pickObject({{
+                x: event.clientX - rect.left,
+                y: event.clientY - rect.top,
+                radius: 8,
+                layerIds: ['papers']
+              }});
+              if (info && info.object) {{
+                acknowledgePaperSelection(info.object);
+                emitPaperSelection(info.object);
+              }}
+            }},
+            true
+          );
+          selectionBridgeBound = true;
+        }}
+      }}
       return deckgl;
     }}
 
@@ -313,7 +395,7 @@ def _write_viewer_html(universe_dir: Path, asset_dir: str) -> str:
         (Math.min(...ys) + Math.max(...ys)) / 2,
         (Math.min(...zs) + Math.max(...zs)) / 2
       ];
-      currentViewState = {{target: center, rotationX: 25, rotationOrbit: 35, zoom: 0.2}};
+      currentViewState = {{target: center, rotationX: 25, rotationOrbit: 35, zoom: INITIAL_ZOOM}};
       ensureDeck().setProps({{initialViewState: currentViewState}});
     }}
 
@@ -338,13 +420,19 @@ def _write_viewer_html(universe_dir: Path, asset_dir: str) -> str:
           id: 'papers',
           data: papers,
           pickable: true,
-          opacity: 0.28,
+          opacity: 0.36,
           radiusUnits: 'pixels',
           getPosition: d => [d.x, d.y, d.z],
-          getRadius: _ => 1.1,
-          getFillColor: d => [...paperColor(d), 190],
+          getRadius: _ => 1.3,
+          getFillColor: d => [...paperColor(d), 205],
           radiusMinPixels: 1,
-          radiusMaxPixels: 3
+          radiusMaxPixels: 4,
+          onClick: info => {{
+            if (info.object) {{
+              acknowledgePaperSelection(info.object);
+              emitPaperSelection(info.object);
+            }}
+          }}
         }}));
       }}
       if (showCategories) {{
@@ -352,10 +440,10 @@ def _write_viewer_html(universe_dir: Path, asset_dir: str) -> str:
           id: 'categories',
           data: categories,
           pickable: true,
-          opacity: 0.95,
+          opacity: 0.9,
           radiusUnits: 'pixels',
           getPosition: d => [d.x, d.y, d.z],
-          getRadius: d => Math.max(6, Math.min(18, 6 + Math.log10((d.paper_count || 1) + 1) * 3)),
+          getRadius: d => Math.max(5, Math.min(14, 5 + Math.log10((d.paper_count || 1) + 1) * 2.5)),
           getFillColor: d => [...categoryColor(d), 235],
           onClick: info => {{
             if (info.object) {{
@@ -408,7 +496,7 @@ def _write_viewer_html(universe_dir: Path, asset_dir: str) -> str:
           currentViewState = viewState;
         }}
       }});
-      statusEl.textContent = `papers shown: ${{papers.length.toLocaleString()}} | categories: ${{categories.length.toLocaleString()}} | years: ${{years.length.toLocaleString()}}`;
+      statusEl.textContent = `paper nodes: ${{papers.length.toLocaleString()}} | category anchors: ${{categories.length.toLocaleString()}} | year anchors: ${{years.length.toLocaleString()}}`;
     }}
 
     viewModeEl.addEventListener('change', render);
@@ -436,20 +524,27 @@ def build_paper_universe_viewer(
     universe_root = Path(universe_dir).resolve()
     interactive_dir = universe_root / INTERACTIVE_DIRNAME
     interactive_dir.mkdir(parents=True, exist_ok=True)
+    total_rows = int(pq.ParquetFile(universe_root / "paper_nodes.parquet").metadata.num_rows)
 
     level_entries: List[Dict[str, Any]] = []
+    seen_paths: Set[str] = set()
     for idx, level in enumerate(levels):
-        filename = f"papers_{int(level)}.json"
+        requested = int(level)
+        is_all = requested <= 0 or requested >= total_rows
+        filename = "papers_all.json" if is_all else f"papers_{requested}.json"
+        if filename in seen_paths:
+            continue
+        seen_paths.add(filename)
         rows = _paper_rows_for_level(
             universe_root,
-            sample_size=int(level),
+            sample_size=int(requested),
             seed=42 + idx,
             batch_rows=int(batch_rows),
         )
         _write_json(interactive_dir / filename, rows)
         level_entries.append(
             {
-                "label": f"{len(rows):,} papers",
+                "label": f"All papers ({len(rows):,})" if is_all else f"{len(rows):,} papers",
                 "rows": len(rows),
                 "path": filename,
             }
@@ -482,10 +577,18 @@ def build_paper_universe_viewer(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build an interactive HTML viewer for the paper universe.")
     parser.add_argument("--universe-dir", default=str(DEFAULT_UNIVERSE_DIR))
-    parser.add_argument("--levels", default="50000,200000", help="Comma-separated paper sample sizes.")
+    parser.add_argument("--levels", default="50000,200000,all", help="Comma-separated paper sample sizes. Use 'all' for the full dataset.")
     parser.add_argument("--batch-rows", type=int, default=DEFAULT_BATCH_ROWS)
     args = parser.parse_args()
-    levels = [int(part) for part in str(args.levels).split(",") if str(part).strip()]
+    levels: List[int] = []
+    for part in str(args.levels).split(","):
+        token = str(part).strip()
+        if not token:
+            continue
+        if token.lower() == "all":
+            levels.append(-1)
+        else:
+            levels.append(int(token))
     result = build_paper_universe_viewer(
         universe_dir=args.universe_dir,
         levels=levels,

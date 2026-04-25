@@ -11,6 +11,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from models.shared.data import _build_metadata_embedding_samples, build_dataset
+import models.shared.training as training
 from models.shared.training import Trainer
 
 
@@ -70,6 +71,71 @@ def test_build_dataset_uses_paper_text_parquet_for_full_text_models(tmp_path: Pa
     assert all(sample.get("target") != sample.get("text") for sample in samples)
     assert any("Chunked Paper Training" in sample["text"] for sample in samples)
     assert all(sample.get("paper_id") == "2401.00001" for sample in samples)
+
+
+def test_build_dataset_zero_max_samples_means_unlimited_paper_text(tmp_path: Path) -> None:
+    dataset_dir = tmp_path / "paper_text"
+    dataset_dir.mkdir()
+    _write_parquet(
+        dataset_dir / "train_00000.parquet",
+        [
+            {
+                "paper_id": "2401.00001",
+                "canonical_paper_id": "2401.00001",
+                "paper_version": "v1",
+                "pdf_path": "/tmp/2401.00001.pdf",
+                "title": "Unlimited Paper One",
+                "abstract": "We propose a first unlimited paper sample.",
+                "authors": "Ada",
+                "categories": "cs.LG",
+                "license": "cc-by-4.0",
+                "update_date": "2024-01-15",
+                "metadata_found": True,
+                "text": " ".join(f"First body section {idx}." for idx in range(80)),
+                "text_source": "raw_pdf",
+                "text_is_partial": False,
+                "text_char_count": 900,
+                "token_count": 180,
+                "page_count": 5,
+            },
+            {
+                "paper_id": "2401.00002",
+                "canonical_paper_id": "2401.00002",
+                "paper_version": "v1",
+                "pdf_path": "/tmp/2401.00002.pdf",
+                "title": "Unlimited Paper Two",
+                "abstract": "We propose a second unlimited paper sample.",
+                "authors": "Alan",
+                "categories": "cs.AI",
+                "license": "cc-by-4.0",
+                "update_date": "2024-01-16",
+                "metadata_found": True,
+                "text": " ".join(f"Second body section {idx}." for idx in range(80)),
+                "text_source": "raw_pdf",
+                "text_is_partial": False,
+                "text_char_count": 900,
+                "token_count": 180,
+                "page_count": 5,
+            },
+        ],
+    )
+    config = {
+        "model_id": "A2",
+        "dataset": {
+            "sources": ["paper_text_parquet"],
+            "construction": {
+                "paper_dataset_dir": str(dataset_dir),
+                "max_samples": 0,
+            },
+        },
+    }
+
+    samples = build_dataset(config)
+
+    assert {sample["text"] for sample in samples} == {
+        "We propose a first unlimited paper sample.",
+        "We propose a second unlimited paper sample.",
+    }
 
 
 def test_metadata_embedding_samples_use_title_query_and_metadata_card() -> None:
@@ -216,6 +282,58 @@ def test_trainer_build_hf_dataset_uses_direct_paper_parquet_for_p1(tmp_path: Pat
     assert first["target"] != first["text"]
     assert "Direct HF Dataset" in first["text"]
     assert first["paper_id"] == "2402.00001"
+
+
+def test_trainer_build_hf_dataset_falls_back_to_hf_dataset_id(monkeypatch, tmp_path: Path) -> None:
+    calls = []
+
+    def _fake_load_dataset(name, **kwargs):
+        calls.append((name, kwargs))
+        return training.HFDataset.from_list(
+            [
+                {
+                    "paper_id": "2407.00001",
+                    "canonical_paper_id": "2407.00001",
+                    "title": "Downloaded Paper Dataset",
+                    "abstract": "We propose loading the one million paper text dataset from Hugging Face.",
+                    "authors": "Ada",
+                    "categories": "cs.LG",
+                    "update_date": "2024-07-01",
+                    "text": "The method uses a remote Hugging Face dataset fallback.",
+                    "text_char_count": 128,
+                    "text_is_partial": False,
+                }
+            ]
+        )
+
+    monkeypatch.setattr(training, "_paper_parquet_paths", lambda _path: [])
+    monkeypatch.setattr(training, "load_dataset", _fake_load_dataset)
+
+    config = {
+        "model_id": "A2",
+        "dataset": {
+            "sources": ["paper_text_parquet"],
+            "cache_dir": str(tmp_path / "hf-cache"),
+            "construction": {
+                "paper_dataset_dir": str(tmp_path / "missing-local-copy"),
+                "paper_dataset_id": "PeytonT/1m_papers_text",
+                "max_samples": 0,
+            },
+        },
+        "training": {"model_type": "seq2seq"},
+    }
+
+    ds = Trainer(config, model_stub=None)._build_hf_dataset()
+
+    assert ds is not None
+    assert calls == [
+        (
+            "PeytonT/1m_papers_text",
+            {"split": "train", "cache_dir": str(tmp_path / "hf-cache")},
+        )
+    ]
+    assert ds[0]["text"].startswith("We propose loading")
+    assert "Hugging Face" in ds[0]["target"]
 
 
 def test_trainer_build_hf_dataset_uses_direct_paper_parquet_for_m6_pairs_with_teacher_embeddings(tmp_path: Path) -> None:

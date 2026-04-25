@@ -85,10 +85,10 @@ class RepoGraph(ProgramGraph):
         pid, kind, res, span = parse_program_uri(uri)
         if pid != self.program_id:
             raise ValueError(f"program id mismatch: {pid} != {self.program_id}")
-        if kind == "artifact":
+        if kind in ("artifact", "file"):
             abs_fp = os.path.abspath(os.path.join(self.repo_root, res))
             if not os.path.isfile(abs_fp):
-                raise FileNotFoundError(f"artifact not found: {abs_fp}")
+                raise FileNotFoundError(f"{kind} not found: {abs_fp}")
             a = int(span[0]) if span else 1
             b = int(span[1]) if span else self._safe_count_lines(abs_fp)
             rel = os.path.relpath(abs_fp, self.repo_root).replace("\\", "/")
@@ -153,5 +153,4 @@ class RepoGraph(ProgramGraph):
             h = ""
         self._file_hash[abs_file] = h
         return h
-
 

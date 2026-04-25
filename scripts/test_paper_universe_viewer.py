@@ -85,3 +85,86 @@ def test_build_paper_universe_viewer_writes_assets(tmp_path: Path) -> None:
     assert manifest["years"]["rows"] == 2
     papers = json.loads((universe_dir / "interactive" / "papers_2.json").read_text())
     assert len(papers) == 2
+    html = Path(result["html_path"]).read_text(encoding="utf-8")
+    assert '<option value="papers" selected>Paper Nodes</option>' in html
+    assert "Paper Nodes + Category Anchors" in html
+    assert "paper nodes:" in html
+    assert "new OrbitView({orbitAxis: 'Z', controller: {doubleClickZoom: false}})" in html
+    assert "const INITIAL_ZOOM = 2.2;" in html
+    assert "zoom: INITIAL_ZOOM" in html
+    assert "function acknowledgePaperSelection(row)" in html
+    assert "paper selected:" in html
+    assert "loading in library" in html
+    assert "new OrbitController()" not in html
+    assert "paper_universe_select_paper" in html
+    assert "emitPaperSelection(info.object)" in html
+    assert "pickObject({" in html
+    assert "Double-click a paper node to load it in the library." in html
+
+
+def test_build_paper_universe_viewer_supports_all_level(tmp_path: Path) -> None:
+    universe_dir = tmp_path / "paper_universe"
+    universe_dir.mkdir(parents=True, exist_ok=True)
+
+    _write_parquet(
+        universe_dir / "paper_nodes.parquet",
+        [
+            {
+                "paper_id": "2401.00001v1",
+                "canonical_paper_id": "2401.00001",
+                "title": "Paper One",
+                "primary_category": "cs.AI",
+                "year": 2024,
+                "x": 0.0,
+                "y": 0.1,
+                "z": 0.2,
+            },
+            {
+                "paper_id": "2401.00002v1",
+                "canonical_paper_id": "2401.00002",
+                "title": "Paper Two",
+                "primary_category": "cs.LG",
+                "year": 2024,
+                "x": 1.0,
+                "y": 1.1,
+                "z": 1.2,
+            },
+            {
+                "paper_id": "2401.00003v1",
+                "canonical_paper_id": "2401.00003",
+                "title": "Paper Three",
+                "primary_category": "math.OC",
+                "year": 2025,
+                "x": -1.0,
+                "y": -1.1,
+                "z": -1.2,
+            },
+        ],
+    )
+    _write_parquet(
+        universe_dir / "category_nodes.parquet",
+        [
+            {"category_id": "cs.AI", "paper_count": 2, "x": 0.2, "y": 0.2, "z": 0.0},
+            {"category_id": "cs.LG", "paper_count": 1, "x": 1.1, "y": 1.0, "z": 1.0},
+        ],
+    )
+    _write_parquet(
+        universe_dir / "year_nodes.parquet",
+        [
+            {"year": 2024, "paper_count": 2, "x": 0.4, "y": 0.5, "z": 0.1},
+            {"year": 2025, "paper_count": 1, "x": -0.8, "y": -0.7, "z": -0.1},
+        ],
+    )
+
+    result = build_paper_universe_viewer(
+        universe_dir=str(universe_dir),
+        levels=[2, -1],
+        batch_rows=2,
+    )
+
+    manifest = json.loads((universe_dir / "interactive" / "manifest.json").read_text())
+    assert [entry["path"] for entry in manifest["paper_levels"]] == ["papers_2.json", "papers_all.json"]
+    assert manifest["paper_levels"][1]["label"] == "All papers (3)"
+    papers_all = json.loads((universe_dir / "interactive" / "papers_all.json").read_text())
+    assert len(papers_all) == 3
+    assert result["paper_levels"][1]["rows"] == 3

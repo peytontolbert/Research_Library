@@ -643,7 +643,7 @@ We define a canonical experiment spec (JSON), then show concrete examples.
     "construction": {
       "input_fields": ["full_paper_tokens"],
       "target_fields": ["full_paper_tokens_shifted"],
-      "max_samples": 200000,
+      "max_samples": 0,
       "train_val_test_split": [0.9, 0.05, 0.05],
       "shuffling_seed": 123
     },

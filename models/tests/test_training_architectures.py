@@ -240,6 +240,70 @@ def test_training_arguments_kwargs_disables_best_model_without_eval(monkeypatch)
     assert "metric_for_best_model" not in kwargs
 
 
+def test_training_arguments_kwargs_uses_safe_eval_memory_defaults(monkeypatch) -> None:
+    class _Args:
+        def __init__(
+            self,
+            output_dir=None,
+            evaluation_strategy=None,
+            per_device_train_batch_size=None,
+            per_device_eval_batch_size=None,
+            prediction_loss_only=None,
+            eval_accumulation_steps=None,
+            torch_empty_cache_steps=None,
+            **kwargs,
+        ):
+            pass
+
+    monkeypatch.setattr(training, "TrainingArguments", _Args)
+
+    kwargs = training._training_arguments_kwargs(
+        {"batch_size": 4, "evaluation_strategy": "steps", "eval_steps": 200},
+        output_dir="out",
+        has_eval=True,
+        use_cuda=True,
+    )
+
+    assert kwargs["per_device_train_batch_size"] == 4
+    assert kwargs["per_device_eval_batch_size"] == 1
+    assert kwargs["prediction_loss_only"] is True
+    assert kwargs["eval_accumulation_steps"] == 1
+    assert kwargs["torch_empty_cache_steps"] == 200
+
+
+def test_maybe_limit_eval_dataset_caps_selectable_dataset() -> None:
+    class _Dataset:
+        def __init__(self, rows):
+            self.rows = list(rows)
+
+        def __len__(self):
+            return len(self.rows)
+
+        def select(self, indices):
+            return _Dataset([self.rows[i] for i in indices])
+
+    capped = training._maybe_limit_eval_dataset(_Dataset(range(1000)), {"eval_max_samples": 128})
+
+    assert len(capped) == 128
+
+
+def test_resolve_resume_checkpoint_defaults_to_latest(tmp_path) -> None:
+    (tmp_path / "checkpoint-10").mkdir()
+    (tmp_path / "checkpoint-200").mkdir()
+    (tmp_path / "checkpoint-bad").mkdir()
+
+    assert training._resolve_resume_checkpoint(str(tmp_path), {}) == str(tmp_path / "checkpoint-200")
+    assert training._resolve_resume_checkpoint(str(tmp_path), {"resume_from_checkpoint": False}) is None
+    assert training._resolve_resume_checkpoint(
+        str(tmp_path),
+        {"resume_from_checkpoint": str(tmp_path / "checkpoint-10")},
+    ) == str(tmp_path / "checkpoint-10")
+    assert training._resolve_resume_checkpoint(
+        str(tmp_path),
+        {"resume_from_checkpoint": str(tmp_path / "missing" / "checkpoint-1000")},
+    ) is None
+
+
 def test_trainer_label_to_id_is_available() -> None:
     trainer = Trainer(config=_config("M4", "encoder", "allenai/scibert_scivocab_uncased", model_type="classifier"), model_stub=None)
 

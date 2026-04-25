@@ -17,7 +17,7 @@ def main() -> None:
     """
     Start the uvicorn server for the Repository Library API.
     """
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8011)
 
 
 if __name__ == "__main__":

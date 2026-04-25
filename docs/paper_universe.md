@@ -11,6 +11,9 @@
   - paper nodes
   - category nodes
   - membership edges from papers to categories
+- The default rendered/viewer experience should be paper-first: sampled papers
+  are the plotted nodes, while category/year layers are optional anchors for
+  navigation and orientation.
 
 This is intentionally separate from the repository universe:
 
