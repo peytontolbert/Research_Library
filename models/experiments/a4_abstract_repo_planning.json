@@ -1,0 +1,106 @@
+{
+  "experiment_name": "a4_abstract_repo_planning_draft",
+  "model_id": "A4",
+  "tier": "T2_abstract",
+  "backbone": {
+    "type": "encoder",
+    "base_model": "allenai/scibert_scivocab_uncased",
+    "adapter_type": "none",
+    "parameters_millions": 110,
+    "cache_dir": "/data/checkpoints",
+    "load_in_8bit": false,
+    "load_in_4bit": false
+  },
+  "dataset": {
+    "sources": [
+      "arxiv_metadata",
+      "github_repos"
+    ],
+    "filters": {
+      "years": [
+        2000,
+        2025
+      ]
+    },
+    "construction": {
+      "input_fields": [
+        "abstract",
+        "repo_graph"
+      ],
+      "target_fields": [
+        "modules"
+      ],
+      "max_samples": 4000,
+      "train_val_test_split": [
+        0.9,
+        0.1,
+        0.0
+      ],
+      "shuffling_seed": 42
+    },
+    "tokenization": {
+      "tokenizer_name": "allenai/scibert_scivocab_uncased",
+      "max_source_tokens": 512,
+      "max_target_tokens": 128,
+      "truncate_strategy": "longest_first"
+    },
+    "cache_dir": "/data/checkpoints"
+  },
+  "training": {
+    "batch_size": 8,
+    "gradient_accumulation_steps": 1,
+    "num_epochs": 3,
+    "learning_rate": 5e-05,
+    "optimizer": "adamw",
+    "weight_decay": 0.01,
+    "warmup_steps": 100,
+    "precision": "bf16",
+    "gradient_checkpointing": false,
+    "objective": "cross_entropy",
+    "checkpoint_dir": "models/checkpoints/A4",
+    "cache_dir": "/data/checkpoints",
+    "finetune_strategy": "full_finetune",
+    "use_hf_trainer": true,
+    "max_steps": 1000,
+    "allow_cpu_trainer": true,
+    "force_cpu": false,
+    "save_steps": 200,
+    "logging_steps": 50,
+    "eval_strategy": "no",
+    "eval_steps": 200,
+    "evaluation_strategy": "no",
+    "metric_for_best_model": "eval_loss",
+    "load_best_model_at_end": false,
+    "model_type": "classifier",
+    "resume_from_checkpoint": false,
+    "num_labels": 1024
+  },
+  "evaluation": {
+    "metrics": [
+      "accuracy",
+      "macro_f1"
+    ],
+    "eval_interval_steps": 200,
+    "early_stopping": {
+      "metric": "validation_loss",
+      "patience": 2
+    }
+  },
+  "inference": {
+    "max_new_tokens": 256,
+    "temperature": 0.7,
+    "top_p": 0.95,
+    "beam_size": 1
+  },
+  "compute": {
+    "gpus": [
+      {
+        "type": "RTX_3090",
+        "count": 4,
+        "memory_gb": 24
+      }
+    ],
+    "estimated_gpu_hours": 0,
+    "distributed_strategy": "ddp"
+  }
+}

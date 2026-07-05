@@ -1,0 +1,105 @@
+{
+  "experiment_name": "m4_paper_link_prediction_draft",
+  "model_id": "M4",
+  "tier": "T1_metadata",
+  "backbone": {
+    "type": "encoder",
+    "base_model": "allenai/scibert_scivocab_uncased",
+    "adapter_type": "none",
+    "parameters_millions": 110,
+    "cache_dir": "/data/checkpoints",
+    "load_in_8bit": false,
+    "load_in_4bit": false
+  },
+  "dataset": {
+    "sources": [
+      "paper_universe_graph"
+    ],
+    "filters": {
+      "years": [
+        2000,
+        2025
+      ]
+    },
+    "construction": {
+      "paper_universe_dir": "exports/_paper_universe",
+      "input_fields": [
+        "paper_graph_node"
+      ],
+      "target_fields": [
+        "linked_papers"
+      ],
+      "max_samples": 4000,
+      "train_val_test_split": [
+        0.9,
+        0.1,
+        0.0
+      ],
+      "shuffling_seed": 42
+    },
+    "tokenization": {
+      "tokenizer_name": "allenai/scibert_scivocab_uncased",
+      "max_source_tokens": 512,
+      "max_target_tokens": 128,
+      "truncate_strategy": "longest_first"
+    },
+    "cache_dir": "/data/checkpoints"
+  },
+  "training": {
+    "batch_size": 8,
+    "gradient_accumulation_steps": 1,
+    "num_epochs": 3,
+    "learning_rate": 5e-05,
+    "optimizer": "adamw",
+    "weight_decay": 0.01,
+    "warmup_steps": 100,
+    "precision": "bf16",
+    "gradient_checkpointing": false,
+    "objective": "link_prediction",
+    "checkpoint_dir": "models/checkpoints/M4",
+    "cache_dir": "/data/checkpoints",
+    "finetune_strategy": "full_finetune",
+    "use_hf_trainer": true,
+    "max_steps": 1000,
+    "allow_cpu_trainer": true,
+    "force_cpu": false,
+    "save_steps": 200,
+    "logging_steps": 50,
+    "eval_strategy": "no",
+    "eval_steps": 200,
+    "evaluation_strategy": "no",
+    "metric_for_best_model": "eval_loss",
+    "load_best_model_at_end": false,
+    "model_type": "classifier",
+    "num_labels": 2,
+    "resume_from_checkpoint": false
+  },
+  "evaluation": {
+    "metrics": [
+      "accuracy",
+      "macro_f1"
+    ],
+    "eval_interval_steps": 200,
+    "early_stopping": {
+      "metric": "validation_loss",
+      "patience": 2
+    }
+  },
+  "inference": {
+    "max_new_tokens": 256,
+    "temperature": 0.7,
+    "top_p": 0.95,
+    "beam_size": 1
+  },
+  "compute": {
+    "gpus": [
+      {
+        "type": "RTX_3090",
+        "count": 4,
+        "memory_gb": 24
+      }
+    ],
+    "estimated_gpu_hours": 0,
+    "distributed_strategy": "ddp"
+  }
+}

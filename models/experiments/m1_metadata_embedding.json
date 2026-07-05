@@ -1,0 +1,110 @@
+{
+  "experiment_name": "m1_metadata_embedding",
+  "model_id": "M1",
+  "tier": "T1_metadata",
+  "backbone": {
+    "type": "encoder",
+    "base_model": "allenai/scibert_scivocab_uncased",
+    "adapter_type": "lora",
+    "parameters_millions": 110,
+    "cache_dir": "/data/checkpoints",
+    "load_in_8bit": false,
+    "load_in_4bit": false
+  },
+  "dataset": {
+    "sources": [
+      "paper_text_parquet"
+    ],
+    "filters": {
+      "years": [
+        2000,
+        2025
+      ]
+    },
+    "construction": {
+      "input_fields": [
+        "title",
+        "abstract",
+        "categories",
+        "authors"
+      ],
+      "paper_dataset_dir": "/arxiv/huggingface/paper_text_1m_dedup_v1",
+      "paper_dataset_id": "PeytonT/1m_papers_text",
+      "streaming": true,
+      "streaming_epoch_samples": 2000000,
+      "streaming_shuffle_buffer": 10000,
+      "target_fields": [
+        "metadata_embedding"
+      ],
+      "max_samples": 0,
+      "train_val_test_split": [
+        0.8,
+        0.1,
+        0.1
+      ],
+      "shuffling_seed": 42
+    },
+    "tokenization": {
+      "tokenizer_name": "allenai/scibert_scivocab_uncased",
+      "max_source_tokens": 256,
+      "max_target_tokens": 512,
+      "truncate_strategy": "longest_first"
+    },
+    "cache_dir": "/data/checkpoints"
+  },
+  "training": {
+    "batch_size": 512,
+    "gradient_accumulation_steps": 1,
+    "num_epochs": 1,
+    "learning_rate": 0.0001,
+    "optimizer": "adamw",
+    "weight_decay": 0.01,
+    "warmup_steps": 1000,
+    "precision": "bf16",
+    "gradient_checkpointing": true,
+    "objective": "contrastive",
+    "checkpoint_dir": "models/checkpoints/M1",
+    "cache_dir": "/data/checkpoints",
+    "finetune_strategy": "peft_lora",
+    "use_hf_trainer": true,
+    "allow_cpu_trainer": true,
+    "force_cpu": false,
+    "max_steps": -1,
+    "save_steps": 500,
+    "logging_steps": 50,
+    "eval_strategy": "steps",
+    "eval_steps": 5000,
+    "evaluation_strategy": "steps",
+    "metric_for_best_model": "eval_loss",
+    "load_best_model_at_end": true,
+    "model_type": "contrastive"
+  },
+  "evaluation": {
+    "metrics": [
+      "recall_at_10",
+      "ndcg_at_10"
+    ],
+    "eval_interval_steps": 200,
+    "early_stopping": {
+      "metric": "validation_loss",
+      "patience": 2
+    }
+  },
+  "inference": {
+    "max_new_tokens": 256,
+    "temperature": 0.7,
+    "top_p": 0.95,
+    "beam_size": 1
+  },
+  "compute": {
+    "gpus": [
+      {
+        "type": "RTX_3090",
+        "count": 4,
+        "memory_gb": 24
+      }
+    ],
+    "estimated_gpu_hours": 0,
+    "distributed_strategy": "ddp"
+  }
+}

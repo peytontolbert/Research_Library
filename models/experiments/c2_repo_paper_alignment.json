@@ -1,0 +1,97 @@
+{
+  "experiment_name": "c2_repo_paper_alignment_pairs",
+  "model_id": "C2",
+  "tier": "T5_cross",
+  "backbone": {
+    "type": "encoder",
+    "base_model": "sentence-transformers/all-MiniLM-L6-v2",
+    "adapter_type": "lora",
+    "parameters_millions": 1000,
+    "cache_dir": "/data/checkpoints",
+    "load_in_8bit": false,
+    "load_in_4bit": false
+  },
+  "dataset": {
+    "sources": [
+      "paper_repo_pairs"
+    ],
+    "tokenization": {
+      "tokenizer_name": "sentence-transformers/all-MiniLM-L6-v2",
+      "max_source_tokens": 256,
+      "max_target_tokens": 256,
+      "truncate_strategy": "longest_first"
+    },
+    "cache_dir": "/data/checkpoints",
+    "quality_filters": {
+      "pairs_min_chars": 64,
+      "pairs_max_chars": 131072
+    },
+    "construction": {
+      "max_samples": 1000,
+      "alignment_path": "exports/paper_repo_span_align.jsonl",
+      "train_val_test_split": [
+        0.9,
+        0.1,
+        0.0
+      ],
+      "shuffling_seed": 42
+    }
+  },
+  "training": {
+    "batch_size": 8,
+    "gradient_accumulation_steps": 1,
+    "num_epochs": 1,
+    "learning_rate": 5e-05,
+    "optimizer": "adamw",
+    "weight_decay": 0.01,
+    "warmup_steps": 100,
+    "precision": "bf16",
+    "gradient_checkpointing": true,
+    "objective": "contrastive",
+    "checkpoint_dir": "models/checkpoints/C2",
+    "cache_dir": "/data/checkpoints",
+    "finetune_strategy": "full_finetune",
+    "use_hf_trainer": true,
+    "max_steps": 1000,
+    "allow_cpu_trainer": false,
+    "force_cpu": false,
+    "save_steps": 200,
+    "logging_steps": 50,
+    "eval_strategy": "steps",
+    "eval_steps": 200,
+    "evaluation_strategy": "steps",
+    "metric_for_best_model": "eval_loss",
+    "load_best_model_at_end": false,
+    "model_type": "contrastive",
+    "eval_split": 0.1,
+    "resume_from_checkpoint": false
+  },
+  "evaluation": {
+    "metrics": [
+      "recall_at_10",
+      "ndcg_at_10"
+    ],
+    "eval_interval_steps": 200,
+    "early_stopping": {
+      "metric": "validation_loss",
+      "patience": 2
+    }
+  },
+  "inference": {
+    "max_new_tokens": 256,
+    "temperature": 0.7,
+    "top_p": 0.95,
+    "beam_size": 1
+  },
+  "compute": {
+    "gpus": [
+      {
+        "type": "RTX_3090",
+        "count": 4,
+        "memory_gb": 24
+      }
+    ],
+    "estimated_gpu_hours": 0,
+    "distributed_strategy": "ddp"
+  }
+}

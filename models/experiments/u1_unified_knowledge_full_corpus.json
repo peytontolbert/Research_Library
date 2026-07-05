@@ -1,0 +1,139 @@
+{
+  "experiment_name": "u1_unified_knowledge_full_corpus",
+  "model_id": "U1",
+  "tier": "T6_unified",
+  "backbone": {
+    "type": "encoder_decoder",
+    "base_model": "google/flan-t5-base",
+    "adapter_type": "lora",
+    "parameters_millions": 250,
+    "cache_dir": "/data/checkpoints",
+    "load_in_8bit": false,
+    "load_in_4bit": false
+  },
+  "dataset": {
+    "sources": [
+      "corpus_repos",
+      "corpus_papers"
+    ],
+    "corpus_dir": "exports/corpus",
+    "domains": [
+      "deep-learning"
+    ],
+    "filters": {
+      "years": [
+        2000,
+        2025
+      ]
+    },
+    "quality_filters": {
+      "repos_min_chars": 128,
+      "repos_max_chars": 65536,
+      "repos_exclude_path_fragments": [
+        "site-packages",
+        ".venv",
+        "__pycache__",
+        "node_modules",
+        "dist-packages"
+      ],
+      "papers_min_chars": 256,
+      "papers_max_chars": 131072
+    },
+    "corpus_mix": {
+      "repos": 1.0,
+      "papers": 1.0
+    },
+    "tokenization": {
+      "tokenizer_name": "google/flan-t5-base",
+      "max_source_tokens": 512,
+      "max_target_tokens": 256,
+      "truncate_strategy": "longest_first"
+    },
+    "cache_dir": "/data/checkpoints",
+    "construction": {
+      "max_samples": 4000,
+      "train_val_test_split": [
+        0.9,
+        0.1,
+        0.0
+      ]
+    }
+  },
+  "training": {
+    "batch_size": 2,
+    "gradient_accumulation_steps": 8,
+    "num_epochs": 3,
+    "learning_rate": 5e-05,
+    "optimizer": "adamw",
+    "weight_decay": 0.01,
+    "warmup_steps": 100,
+    "precision": "bf16",
+    "gradient_checkpointing": true,
+    "objective": "cross_entropy",
+    "checkpoint_dir": "models/checkpoints/U1",
+    "cache_dir": "/data/checkpoints",
+    "finetune_strategy": "peft_lora",
+    "use_hf_trainer": true,
+    "max_steps": 1000,
+    "eval_split": 0.01,
+    "allow_cpu_trainer": true,
+    "force_cpu": false,
+    "save_steps": 200,
+    "logging_steps": 50,
+    "eval_strategy": "no",
+    "eval_steps": 2000,
+    "evaluation_strategy": "no",
+    "metric_for_best_model": "eval_loss",
+    "load_best_model_at_end": false,
+    "curriculum": [
+      {
+        "name": "phase1_paper_heavy",
+        "corpus_mix": {
+          "repos": 0.3,
+          "papers": 1.0
+        },
+        "max_steps": 5000
+      },
+      {
+        "name": "phase2_balanced",
+        "corpus_mix": {
+          "repos": 1.0,
+          "papers": 1.0
+        },
+        "max_steps": 20000
+      }
+    ],
+    "resume_from_checkpoint": false,
+    "model_type": "seq2seq"
+  },
+  "evaluation": {
+    "metrics": [
+      "perplexity"
+    ],
+    "eval_interval_steps": 2000,
+    "early_stopping": {
+      "metric": "validation_loss",
+      "patience": 2
+    }
+  },
+  "inference": {
+    "max_new_tokens": 256,
+    "temperature": 0.7,
+    "top_p": 0.95,
+    "beam_size": 1
+  },
+  "compute": {
+    "gpus": [
+      {
+        "type": "A100",
+        "count": 8,
+        "memory_gb": 80
+      }
+    ],
+    "estimated_gpu_hours": 0,
+    "distributed_strategy": "ddp"
+  },
+  "output": {
+    "checkpoint_dir": "models/checkpoints/U1_full_corpus"
+  }
+}

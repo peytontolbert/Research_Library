@@ -1,0 +1,108 @@
+{
+  "experiment_name": "a3_abstract_keywords_draft",
+  "model_id": "A3",
+  "tier": "T2_abstract",
+  "backbone": {
+    "type": "encoder_decoder",
+    "base_model": "google/flan-t5-base",
+    "adapter_type": "lora",
+    "parameters_millions": 250,
+    "cache_dir": "/data/checkpoints",
+    "load_in_8bit": false,
+    "load_in_4bit": false
+  },
+  "dataset": {
+    "sources": [
+      "paper_text_parquet"
+    ],
+    "filters": {
+      "years": [
+        2000,
+        2025
+      ]
+    },
+    "construction": {
+      "paper_dataset_dir": "/arxiv/huggingface/paper_text_1m_dedup_v1",
+      "paper_dataset_id": "PeytonT/1m_papers_text",
+      "streaming": true,
+      "streaming_epoch_samples": 1000000,
+      "streaming_shuffle_buffer": 10000,
+      "input_fields": [
+        "abstract"
+      ],
+      "target_fields": [
+        "keywords"
+      ],
+      "max_samples": 0,
+      "train_val_test_split": [
+        0.8,
+        0.1,
+        0.1
+      ],
+      "shuffling_seed": 42
+    },
+    "tokenization": {
+      "tokenizer_name": "google/flan-t5-base",
+      "max_source_tokens": 768,
+      "max_target_tokens": 128,
+      "truncate_strategy": "longest_first"
+    },
+    "cache_dir": "/data/checkpoints"
+  },
+  "training": {
+    "batch_size": 256,
+    "gradient_accumulation_steps": 1,
+    "num_epochs": 1,
+    "learning_rate": 0.0001,
+    "optimizer": "adamw",
+    "weight_decay": 0.01,
+    "warmup_steps": 1000,
+    "precision": "bf16",
+    "gradient_checkpointing": true,
+    "objective": "cross_entropy",
+    "checkpoint_dir": "models/checkpoints/A3",
+    "resume_from_checkpoint": false,
+    "cache_dir": "/data/checkpoints",
+    "finetune_strategy": "peft_lora",
+    "use_hf_trainer": true,
+    "max_steps": -1,
+    "allow_cpu_trainer": true,
+    "force_cpu": false,
+    "save_steps": 500,
+    "logging_steps": 50,
+    "eval_strategy": "steps",
+    "eval_steps": 5000,
+    "evaluation_strategy": "steps",
+    "metric_for_best_model": "eval_loss",
+    "load_best_model_at_end": true,
+    "model_type": "seq2seq"
+  },
+  "evaluation": {
+    "metrics": [
+      "rougeL",
+      "bleu"
+    ],
+    "eval_interval_steps": 200,
+    "early_stopping": {
+      "metric": "validation_loss",
+      "patience": 2
+    }
+  },
+  "inference": {
+    "max_new_tokens": 256,
+    "temperature": 0.7,
+    "top_p": 0.95,
+    "beam_size": 1
+  },
+  "compute": {
+    "gpus": [
+      {
+        "type": "RTX_3090",
+        "count": 4,
+        "memory_gb": 24
+      }
+    ],
+    "estimated_gpu_hours": 0,
+    "distributed_strategy": "ddp"
+  }
+}

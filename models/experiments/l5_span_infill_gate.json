@@ -1,0 +1,96 @@
+{
+  "experiment_name": "l5_span_infill_gate_minilm",
+  "model_id": "L5",
+  "tier": "repository_library_search_stack",
+  "backbone": {
+    "type": "encoder",
+    "base_model": "sentence-transformers/all-MiniLM-L6-v2",
+    "adapter_type": "none",
+    "parameters_millions": 22,
+    "cache_dir": "/data/checkpoints",
+    "load_in_8bit": false,
+    "load_in_4bit": false
+  },
+  "dataset": {
+    "sources": [
+      "github_repos"
+    ],
+    "filters": {
+      "years": [
+        2000,
+        2026
+      ]
+    },
+    "construction": {
+      "max_samples": 4000,
+      "train_val_test_split": [
+        0.9,
+        0.1,
+        0.0
+      ],
+      "shuffling_seed": 42,
+      "input_fields": [
+        "prompt",
+        "candidate_span",
+        "verifier_state"
+      ],
+      "target_fields": [
+        "copy_compose_generate"
+      ]
+    },
+    "quality_filters": {
+      "code_min_chars": 64,
+      "code_max_chars": 1000000,
+      "papers_min_chars": 256
+    },
+    "tokenization": {
+      "tokenizer_name": "sentence-transformers/all-MiniLM-L6-v2",
+      "max_source_tokens": 256,
+      "max_target_tokens": 256,
+      "truncate_strategy": "longest_first"
+    },
+    "cache_dir": "/data/checkpoints"
+  },
+  "training": {
+    "batch_size": 8,
+    "gradient_accumulation_steps": 1,
+    "num_epochs": 3,
+    "learning_rate": 5e-05,
+    "optimizer": "adamw",
+    "weight_decay": 0.01,
+    "warmup_steps": 100,
+    "precision": "bf16",
+    "gradient_checkpointing": false,
+    "objective": "cross_entropy",
+    "checkpoint_dir": "models/checkpoints/L5",
+    "cache_dir": "/data/checkpoints",
+    "finetune_strategy": "full_finetune",
+    "use_hf_trainer": true,
+    "max_steps": 1000,
+    "allow_cpu_trainer": true,
+    "force_cpu": false,
+    "save_steps": 200,
+    "logging_steps": 50,
+    "eval_strategy": "steps",
+    "eval_steps": 200,
+    "evaluation_strategy": "steps",
+    "eval_split": 0.1,
+    "metric_for_best_model": "eval_loss",
+    "load_best_model_at_end": false,
+    "resume_from_checkpoint": false,
+    "model_type": "classifier",
+    "num_labels": 3
+  },
+  "evaluation": {
+    "metrics": [
+      "accuracy"
+    ]
+  },
+  "inference": {
+    "beam_size": 1,
+    "max_new_tokens": 128,
+    "temperature": 0.2,
+    "top_p": 0.95
+  },
+  "notes": "Search-stack role added to match models.md coverage; dataset builder may need role-specific supervised labels before promotion."
+}

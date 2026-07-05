@@ -1,0 +1,102 @@
+{
+  "experiment_name": "s1_skill_adapter_generator_draft",
+  "model_id": "S1",
+  "tier": "T7_selfplay",
+  "backbone": {
+    "type": "decoder",
+    "base_model": "meta-llama/Llama-3.2-1B",
+    "adapter_type": "lora",
+    "parameters_millions": 1000,
+    "cache_dir": "/data/checkpoints",
+    "load_in_8bit": true,
+    "load_in_4bit": false
+  },
+  "dataset": {
+    "sources": [
+      "generated_selfplay_traces"
+    ],
+    "filters": {
+      "years": [
+        2000,
+        2025
+      ]
+    },
+    "construction": {
+      "input_fields": [
+        "task_distribution",
+        "environment_state"
+      ],
+      "target_fields": [
+        "skill_adapter"
+      ],
+      "max_samples": 0,
+      "train_val_test_split": [
+        0.8,
+        0.1,
+        0.1
+      ],
+      "shuffling_seed": 42
+    },
+    "tokenization": {
+      "tokenizer_name": "meta-llama/Llama-3.2-1B",
+      "max_source_tokens": 2048,
+      "max_target_tokens": 512,
+      "truncate_strategy": "longest_first"
+    },
+    "cache_dir": "/data/checkpoints"
+  },
+  "training": {
+    "batch_size": 4,
+    "gradient_accumulation_steps": 1,
+    "num_epochs": 3,
+    "learning_rate": 0.0001,
+    "optimizer": "adamw",
+    "weight_decay": 0.01,
+    "warmup_steps": 1000,
+    "precision": "bf16",
+    "gradient_checkpointing": true,
+    "objective": "rl_ppo",
+    "checkpoint_dir": "models/checkpoints/s1",
+    "cache_dir": "/data/checkpoints",
+    "finetune_strategy": "peft_lora",
+    "use_hf_trainer": true,
+    "max_steps": 1000,
+    "allow_cpu_trainer": true,
+    "force_cpu": false,
+    "save_steps": 200,
+    "logging_steps": 50,
+    "eval_strategy": "steps",
+    "eval_steps": 200,
+    "evaluation_strategy": "steps",
+    "metric_for_best_model": "eval_loss",
+    "load_best_model_at_end": true
+  },
+  "evaluation": {
+    "metrics": [
+      "reward",
+      "success_rate"
+    ],
+    "eval_interval_steps": 200,
+    "early_stopping": {
+      "metric": "validation_loss",
+      "patience": 2
+    }
+  },
+  "inference": {
+    "max_new_tokens": 256,
+    "temperature": 0.7,
+    "top_p": 0.95,
+    "beam_size": 1
+  },
+  "compute": {
+    "gpus": [
+      {
+        "type": "RTX_3090",
+        "count": 4,
+        "memory_gb": 24
+      }
+    ],
+    "estimated_gpu_hours": 0,
+    "distributed_strategy": "ddp"
+  }
+}

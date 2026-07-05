@@ -1,6 +1,7 @@
 exports/
 .env
 *.json
+!models/experiments/*.json
 *.jsonl
 *.pt
 *.pt

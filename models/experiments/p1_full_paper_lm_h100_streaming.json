@@ -1,0 +1,98 @@
+{
+  "experiment_name": "p1_full_paper_lm_h100_streaming",
+  "model_id": "P1",
+  "tier": "T3_pdf",
+  "backbone": {
+    "type": "encoder_decoder",
+    "base_model": "google/flan-t5-base",
+    "adapter_type": "lora",
+    "parameters_millions": 250,
+    "cache_dir": "/root/repository_library/hf_cache",
+    "load_in_8bit": false,
+    "load_in_4bit": false
+  },
+  "dataset": {
+    "sources": [
+      "paper_text_parquet"
+    ],
+    "filters": {},
+    "construction": {
+      "paper_dataset_dir": "/root/repository_library/missing_local_paper_text",
+      "paper_dataset_id": "PeytonT/1m_papers_text",
+      "streaming": true,
+      "streaming_epoch_samples": 17117443,
+      "streaming_shuffle_buffer": 10000,
+      "input_fields": [
+        "paper_full_text"
+      ],
+      "target_fields": [
+        "next_tokens"
+      ],
+      "max_samples": 0,
+      "train_val_test_split": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "shuffling_seed": 42,
+      "chunk_chars_text": 3000,
+      "chunk_overlap_text": 300
+    },
+    "tokenization": {
+      "tokenizer_name": "google/flan-t5-base",
+      "max_source_tokens": 1024,
+      "max_target_tokens": 1024,
+      "truncate_strategy": "longest_first"
+    },
+    "cache_dir": "/root/repository_library/hf_cache"
+  },
+  "training": {
+    "batch_size": 32,
+    "gradient_accumulation_steps": 1,
+    "num_epochs": 1,
+    "learning_rate": 0.0001,
+    "optimizer": "adamw",
+    "weight_decay": 0.01,
+    "warmup_steps": 1000,
+    "precision": "bf16",
+    "gradient_checkpointing": true,
+    "objective": "cross_entropy",
+    "checkpoint_dir": "models/checkpoints/P1_h100_full_epoch",
+    "resume_from_checkpoint": false,
+    "cache_dir": "/root/repository_library/hf_cache",
+    "finetune_strategy": "peft_lora",
+    "use_hf_trainer": true,
+    "max_steps": -1,
+    "allow_cpu_trainer": false,
+    "force_cpu": false,
+    "save_steps": 10000,
+    "logging_steps": 50,
+    "eval_strategy": "no",
+    "evaluation_strategy": "no",
+    "load_best_model_at_end": false,
+    "model_type": "seq2seq"
+  },
+  "evaluation": {
+    "metrics": [
+      "perplexity"
+    ],
+    "eval_interval_steps": 0
+  },
+  "inference": {
+    "max_new_tokens": 256,
+    "temperature": 0.7,
+    "top_p": 0.95,
+    "beam_size": 1
+  },
+  "compute": {
+    "gpus": [
+      {
+        "type": "H100",
+        "count": 1,
+        "memory_gb": 80
+      }
+    ],
+    "estimated_gpu_hours": 0,
+    "distributed_strategy": "single_gpu"
+  }
+}
